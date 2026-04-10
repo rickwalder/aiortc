@@ -1017,7 +1017,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             oldTransports = set()
             slaveMids = bundle.items[1:]
             for transceiver in self.__transceivers:
-                if transceiver.mid in slaveMids and not transceiver._bundled:
+                if (
+                    transceiver.mid in slaveMids
+                    and transceiver.receiver.transport != primaryTransport
+                ):
                     oldTransports.add(transceiver.receiver.transport)
                     transceiver.receiver.setTransport(primaryTransport)
                     transceiver.sender.setTransport(primaryTransport)
@@ -1025,7 +1028,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             if (
                 self.__sctp
                 and self.__sctp.mid in slaveMids
-                and not self.__sctp._bundled
+                and self.__sctp.transport != primaryTransport
             ):
                 oldTransports.add(self.__sctp.transport)
                 self.__sctp.setTransport(primaryTransport)
