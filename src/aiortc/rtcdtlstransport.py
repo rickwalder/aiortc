@@ -18,6 +18,7 @@ from pyee.asyncio import AsyncIOEventEmitter
 from pylibsrtp import Policy, Session
 
 from . import clock, rtp
+from .congestion import TransportCongestionController
 from .rtcicetransport import RTCIceTransport
 from .rtcrtpparameters import RTCRtpReceiveParameters, RTCRtpSendParameters
 from .rtp import (
@@ -227,6 +228,9 @@ class DataReceiver(Protocol):
 
 
 class RtpReceiver(Protocol):
+    kind: str
+
+    def _get_rtcp_ssrc(self) -> Optional[int]: ...
     def _handle_disconnect(self) -> None: ...
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
     async def _handle_rtp_packet(
@@ -236,6 +240,13 @@ class RtpReceiver(Protocol):
 
 class RtpSender(Protocol):
     _ssrc: int
+    kind: str
+
+    def _get_target_bitrate(self) -> Optional[int]: ...
+
+    def _get_bitrate_bounds(self) -> tuple[int, int]: ...
+
+    def _set_target_bitrate(self, bitrate: int) -> None: ...
 
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
 
@@ -360,6 +371,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._role = "auto"
         self._rtp_header_extensions_map = rtp.HeaderExtensionsMap()
         self._rtp_router = RtpRouter()
+        self._congestion_controller = TransportCongestionController()
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
         self._task: Optional[asyncio.Future[None]] = None
@@ -605,6 +617,15 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             return
 
         for packet in packets:
+            if isinstance(packet, RtcpPsfbPacket) and packet.fmt == rtp.RTCP_PSFB_APP:
+                try:
+                    bitrate, ssrcs = rtp.unpack_remb_fci(packet.fci)
+                except ValueError:
+                    pass
+                else:
+                    self._congestion_controller.update_receiver_estimate(
+                        bitrate, ssrcs, clock.current_ms()
+                    )
             # route RTCP packet
             for recipient in self._rtp_router.route_rtcp(packet):
                 await recipient._handle_rtcp_packet(packet)
@@ -619,6 +640,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         # route RTP packet
         receiver = self._rtp_router.route_rtp(packet)
         if receiver is not None:
+            remb = self._congestion_controller.observe_incoming_rtp(
+                receiver, packet, arrival_time_ms
+            )
+            if remb is not None:
+                try:
+                    await self._send_rtp(bytes(remb))
+                except ConnectionError:
+                    pass
             await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
 
     async def _recv_next(self) -> None:
@@ -689,12 +718,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             payload_types=[codec.payloadType for codec in parameters.codecs],
             mid=parameters.muxId,
         )
+        self._congestion_controller.register_receiver(receiver)
 
     def _register_rtp_sender(
         self, sender: RtpSender, parameters: RTCRtpSendParameters
     ) -> None:
         self._rtp_header_extensions_map.configure(parameters)
         self._rtp_router.register_sender(sender, ssrc=sender._ssrc)
+        self._congestion_controller.register_sender(sender)
 
     async def _send_data(self, data: bytes) -> None:
         if self._state != State.CONNECTED:
@@ -730,9 +761,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     def _unregister_rtp_receiver(self, receiver: RtpReceiver) -> None:
         self._rtp_router.unregister_receiver(receiver)
+        self._congestion_controller.unregister_receiver(receiver)
 
     def _unregister_rtp_sender(self, sender: RtpSender) -> None:
         self._rtp_router.unregister_sender(sender)
+        self._congestion_controller.unregister_sender(sender)
 
     async def _write_ssl(self) -> None:
         """
