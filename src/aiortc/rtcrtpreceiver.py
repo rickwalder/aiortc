@@ -16,7 +16,6 @@ from .codecs import depayload, get_capabilities, get_decoder, is_rtx
 from .exceptions import InvalidStateError
 from .jitterbuffer import JitterBuffer
 from .mediastreams import MediaStreamError, MediaStreamTrack
-from .rate import RemoteBitrateEstimator
 from .rtcdtlstransport import RTCDtlsTransport
 from .rtcrtpparameters import (
     RTCRtpCapabilities,
@@ -24,7 +23,6 @@ from .rtcrtpparameters import (
     RTCRtpReceiveParameters,
 )
 from .rtp import (
-    RTCP_PSFB_APP,
     RTCP_PSFB_PLI,
     RTCP_RTPFB_NACK,
     RTP_HISTORY_SIZE,
@@ -37,7 +35,6 @@ from .rtp import (
     RtcpSrPacket,
     RtpPacket,
     clamp_packets_lost,
-    pack_remb_fci,
     unwrap_rtx,
 )
 from .stats import (
@@ -275,11 +272,9 @@ class RTCRtpReceiver:
         if kind == "audio":
             self.__jitter_buffer = JitterBuffer(capacity=16, prefetch=4)
             self.__nack_generator = None
-            self.__remote_bitrate_estimator = None
         else:
             self.__jitter_buffer = JitterBuffer(capacity=128, is_video=True)
             self.__nack_generator = NackGenerator()
-            self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self._track: Optional[RemoteStreamTrack] = None
         self.__rtcp_exited = asyncio.Event()
         self.__rtcp_started = asyncio.Event()
@@ -309,6 +304,10 @@ class RTCRtpReceiver:
         The :class:`MediaStreamTrack` which is being handled by the receiver.
         """
         return self._track
+
+    @property
+    def kind(self) -> str:
+        return self.__kind
 
     @property
     def transport(self) -> RTCDtlsTransport:
@@ -458,25 +457,6 @@ class RTCRtpReceiver:
         if not self._enabled:
             return
 
-        # feed bitrate estimator
-        if self.__remote_bitrate_estimator is not None:
-            if packet.extensions.abs_send_time is not None:
-                remb = self.__remote_bitrate_estimator.add(
-                    abs_send_time=packet.extensions.abs_send_time,
-                    arrival_time_ms=arrival_time_ms,
-                    payload_size=len(packet.payload) + packet.padding_size,
-                    ssrc=packet.ssrc,
-                )
-                if self.__rtcp_ssrc is not None and remb is not None:
-                    # send Receiver Estimated Maximum Bitrate feedback
-                    rtcp_packet = RtcpPsfbPacket(
-                        fmt=RTCP_PSFB_APP,
-                        ssrc=self.__rtcp_ssrc,
-                        media_ssrc=0,
-                        fci=pack_remb_fci(*remb),
-                    )
-                    await self._send_rtcp(rtcp_packet)
-
         # keep track of sources
         self.__active_ssrc[packet.ssrc] = clock.current_datetime()
 
@@ -613,6 +593,9 @@ class RTCRtpReceiver:
 
     def _set_rtcp_ssrc(self, ssrc: int) -> None:
         self.__rtcp_ssrc = ssrc
+
+    def _get_rtcp_ssrc(self) -> Optional[int]:
+        return self.__rtcp_ssrc
 
     def __stop_decoder(self) -> None:
         """
