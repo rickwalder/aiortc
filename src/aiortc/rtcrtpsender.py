@@ -50,6 +50,9 @@ from .utils import random16, random32, uint16_add, uint32_add
 logger = logging.getLogger(__name__)
 
 RTT_ALPHA = 0.85
+DEFAULT_TARGET_BITRATE = 1_000_000
+MIN_TARGET_BITRATE = 250_000
+MAX_TARGET_BITRATE = 3_000_000
 
 
 def random_sequence_number() -> int:
@@ -127,6 +130,7 @@ class RTCRtpSender:
         self.__octet_count = 0
         self.__packet_count = 0
         self.__rtt: Optional[float] = None
+        self.__target_bitrate: Optional[int] = None
 
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
@@ -286,8 +290,6 @@ class RTCRtpSender:
                     self.__log_debug(
                         "- receiver estimated maximum bitrate %d bps", bitrate
                     )
-                    if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
-                        self.__encoder.target_bitrate = bitrate
             except ValueError:
                 pass
 
@@ -307,6 +309,10 @@ class RTCRtpSender:
 
         if self.__encoder is None:
             self.__encoder = get_encoder(codec)
+            if self.__target_bitrate is not None and hasattr(
+                self.__encoder, "target_bitrate"
+            ):
+                self.__encoder.target_bitrate = self.__target_bitrate
 
         if isinstance(data, Frame):
             # Encode the frame.
@@ -353,6 +359,28 @@ class RTCRtpSender:
         Request the next frame to be a keyframe.
         """
         self.__force_keyframe = True
+
+    def _get_target_bitrate(self) -> Optional[int]:
+        if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
+            return self.__encoder.target_bitrate
+        return self.__target_bitrate or DEFAULT_TARGET_BITRATE
+
+    def _get_bitrate_bounds(self) -> tuple[int, int]:
+        if self.__kind != "video":
+            return (0, 0)
+        return (MIN_TARGET_BITRATE, MAX_TARGET_BITRATE)
+
+    def _set_target_bitrate(self, bitrate: int) -> None:
+        if self.__kind != "video":
+            return
+        min_bitrate, max_bitrate = self._get_bitrate_bounds()
+        bitrate = max(min_bitrate, min(max_bitrate, bitrate))
+        current = self._get_target_bitrate()
+        if current == bitrate:
+            return
+        self.__target_bitrate = bitrate
+        if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
+            self.__encoder.target_bitrate = bitrate
 
     async def _run_rtp(self, codec: RTCRtpCodecParameters) -> None:
         self.__log_debug("- RTP started")
