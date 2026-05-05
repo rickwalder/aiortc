@@ -375,6 +375,9 @@ class RTCRtpSender:
             return
         min_bitrate, max_bitrate = self._get_bitrate_bounds()
         bitrate = max(min_bitrate, min(max_bitrate, bitrate))
+        current = self._get_target_bitrate()
+        if current == bitrate:
+            return
         self.__target_bitrate = bitrate
         if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
             self.__encoder.target_bitrate = bitrate
