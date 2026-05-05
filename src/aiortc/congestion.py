@@ -7,8 +7,6 @@ from typing import Optional, Protocol
 from .rate import RemoteBitrateEstimator
 from .rtp import RtcpPsfbPacket, RtpPacket, RTCP_PSFB_APP, pack_remb_fci
 
-REMB_REPEAT_INTERVAL_MS = 5000
-
 
 class CongestionControlledSender(Protocol):
     _ssrc: int
@@ -54,7 +52,6 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
-        self.__last_sent_remb: Optional[tuple[int, tuple[int, ...], int]] = None
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
         if receiver.kind == "video":
@@ -118,22 +115,12 @@ class TransportCongestionController:
         )
         if remb is None:
             return None
-        bitrate, ssrcs = remb
-        remb_key = (bitrate, tuple(sorted(ssrcs)))
-        if self.__last_sent_remb is not None:
-            last_bitrate, last_ssrcs, last_sent_ms = self.__last_sent_remb
-            if (
-                last_bitrate == remb_key[0]
-                and last_ssrcs == remb_key[1]
-                and (arrival_time_ms - last_sent_ms) < REMB_REPEAT_INTERVAL_MS
-            ):
-                return None
 
         feedback_ssrc = self.__get_feedback_ssrc()
         if feedback_ssrc is None:
             return None
 
-        self.__last_sent_remb = (remb_key[0], remb_key[1], arrival_time_ms)
+        bitrate, ssrcs = remb
 
         return RtcpPsfbPacket(
             fmt=RTCP_PSFB_APP,
