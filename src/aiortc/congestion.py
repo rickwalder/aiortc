@@ -31,6 +31,7 @@ class SenderState:
     max_bitrate: int
     weight: float
     allocated_bitrate: int
+    applied_bitrate: Optional[int] = None
 
 
 class TransportCongestionController:
@@ -71,6 +72,7 @@ class TransportCongestionController:
             max_bitrate=max_bitrate,
             weight=1.0,
             allocated_bitrate=initial,
+            applied_bitrate=None,
         )
         self.__recompute_allocation()
 
@@ -152,7 +154,7 @@ class TransportCongestionController:
 
         if self.__session_target_bitrate is None:
             for state in self.__senders.values():
-                state.sender._set_target_bitrate(state.allocated_bitrate)
+                self.__apply_sender_target(state)
             return
 
         states = list(self.__senders.values())
@@ -166,7 +168,7 @@ class TransportCongestionController:
         remaining = session - floor
         if remaining <= 0:
             for state in states:
-                state.sender._set_target_bitrate(state.allocated_bitrate)
+                self.__apply_sender_target(state)
             return
 
         allocatable = {
@@ -197,7 +199,14 @@ class TransportCongestionController:
             )
 
         for state in states:
-            state.sender._set_target_bitrate(state.allocated_bitrate)
+            self.__apply_sender_target(state)
+
+    def __apply_sender_target(self, state: SenderState) -> None:
+        bitrate = int(state.allocated_bitrate)
+        if state.applied_bitrate == bitrate:
+            return
+        state.sender._set_target_bitrate(bitrate)
+        state.applied_bitrate = bitrate
 
     def __get_feedback_ssrc(self) -> Optional[int]:
         for receiver in self.__receivers:
