@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Protocol
 
 from .rate import RemoteBitrateEstimator
 from .rtp import RtcpPsfbPacket, RtpPacket, RTCP_PSFB_APP, pack_remb_fci
+
+REMB_REPEAT_INTERVAL_MS = 5000
 
 
 class CongestionControlledSender(Protocol):
@@ -51,6 +54,7 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
+        self.__last_sent_remb: Optional[tuple[int, tuple[int, ...], int]] = None
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
         if receiver.kind == "video":
@@ -114,16 +118,28 @@ class TransportCongestionController:
         )
         if remb is None:
             return None
+        bitrate, ssrcs = remb
+        remb_key = (bitrate, tuple(sorted(ssrcs)))
+        if self.__last_sent_remb is not None:
+            last_bitrate, last_ssrcs, last_sent_ms = self.__last_sent_remb
+            if (
+                last_bitrate == remb_key[0]
+                and last_ssrcs == remb_key[1]
+                and (arrival_time_ms - last_sent_ms) < REMB_REPEAT_INTERVAL_MS
+            ):
+                return None
 
         feedback_ssrc = self.__get_feedback_ssrc()
         if feedback_ssrc is None:
             return None
 
+        self.__last_sent_remb = (remb_key[0], remb_key[1], arrival_time_ms)
+
         return RtcpPsfbPacket(
             fmt=RTCP_PSFB_APP,
             ssrc=feedback_ssrc,
             media_ssrc=0,
-            fci=pack_remb_fci(*remb),
+            fci=pack_remb_fci(bitrate, ssrcs),
         )
 
     def __derive_session_target(self, now_ms: int) -> Optional[int]:
@@ -174,29 +190,66 @@ class TransportCongestionController:
         allocatable = {
             state.sender._ssrc: state.max_bitrate - state.min_bitrate for state in states
         }
-        weight_total = sum(state.weight for state in states if allocatable[state.sender._ssrc] > 0)
+        active_states = [
+            state for state in states if allocatable[state.sender._ssrc] > 0
+        ]
 
-        while remaining > 0 and weight_total > 0:
+        while remaining > 0 and active_states:
+            weight_total = sum(state.weight for state in active_states)
+            if weight_total <= 0:
+                break
+
+            round_remaining = remaining
+            grants: dict[int, int] = {}
+            remainders: list[tuple[float, SenderState]] = []
             distributed = 0
-            for state in states:
-                room = allocatable[state.sender._ssrc]
-                if room <= 0:
-                    continue
 
-                share = max(1, int(remaining * (state.weight / weight_total)))
-                grant = min(room, share, remaining)
+            for state in active_states:
+                room = allocatable[state.sender._ssrc]
+                ideal = round_remaining * (state.weight / weight_total)
+                grant = min(room, math.floor(ideal))
+                grants[state.sender._ssrc] = grant
+                distributed += grant
+                remainders.append((ideal - math.floor(ideal), state))
+
+            leftover = round_remaining - distributed
+            if leftover > 0:
+                for _, state in sorted(remainders, key=lambda item: item[0], reverse=True):
+                    room = allocatable[state.sender._ssrc]
+                    grant = grants[state.sender._ssrc]
+                    if room <= grant:
+                        continue
+                    grants[state.sender._ssrc] += 1
+                    distributed += 1
+                    leftover -= 1
+                    if leftover <= 0:
+                        break
+
+            if distributed <= 0:
+                for state in active_states:
+                    room = allocatable[state.sender._ssrc]
+                    if room <= 0:
+                        continue
+                    grants[state.sender._ssrc] = grants.get(state.sender._ssrc, 0) + 1
+                    distributed += 1
+                    leftover -= 1
+                    if distributed >= remaining:
+                        break
+
+            if distributed <= 0:
+                break
+
+            for state in active_states:
+                grant = grants.get(state.sender._ssrc, 0)
+                if grant <= 0:
+                    continue
                 state.allocated_bitrate += grant
                 allocatable[state.sender._ssrc] -= grant
-                remaining -= grant
-                distributed += grant
-                if remaining <= 0:
-                    break
 
-            if distributed == 0:
-                break
-            weight_total = sum(
-                state.weight for state in states if allocatable[state.sender._ssrc] > 0
-            )
+            remaining -= distributed
+            active_states = [
+                state for state in active_states if allocatable[state.sender._ssrc] > 0
+            ]
 
         for state in states:
             self.__apply_sender_target(state)
