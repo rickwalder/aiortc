@@ -46,7 +46,12 @@ class AimdRateControl:
         self.state = RateControlState.HOLD
 
     def feedback_interval(self) -> int:
-        return 500
+        # Match libwebrtc's REMB-era feedback cadence: allocate roughly 5%
+        # of current bitrate to RTCP feedback, then clamp to 200-1000 ms.
+        rtcp_size_bytes = 80
+        rtcp_bitrate = max(1, int(self.current_bitrate * 0.05))
+        interval_ms = int((rtcp_size_bytes * 8 * 1000) / rtcp_bitrate)
+        return max(200, min(1000, interval_ms))
 
     def set_estimate(self, bitrate: int, now_ms: int) -> None:
         """

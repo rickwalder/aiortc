@@ -255,6 +255,9 @@ class RTCRtpSender:
                         self.__rtt = rtt
                     else:
                         self.__rtt = RTT_ALPHA * self.__rtt + (1 - RTT_ALPHA) * rtt
+                    self.__transport._congestion_controller.set_rtt(
+                        max(1, int(self.__rtt * 1000))
+                    )
 
                 self.__stats.add(
                     RTCRemoteInboundRtpStreamStats(

@@ -96,10 +96,13 @@ class TransportCongestionController:
         if target is None:
             return
 
-        self.__session_target_bitrate = self.__smooth_target(
-            self.__session_target_bitrate, target
-        )
+        self.__session_target_bitrate = target
         self.__recompute_allocation()
+
+    def set_rtt(self, rtt_ms: int) -> None:
+        if rtt_ms <= 0:
+            return
+        self.__remote_bitrate_estimator.rate_control.rtt = rtt_ms
 
     def observe_incoming_rtp(
         self, receiver: CongestionControlledReceiver, packet: RtpPacket, arrival_time_ms: int
@@ -254,15 +257,3 @@ class TransportCongestionController:
             if ssrc is not None:
                 return ssrc
         return None
-
-    @staticmethod
-    def __smooth_target(
-        previous: Optional[int], latest: int
-    ) -> int:
-        if previous is None:
-            return latest
-        if latest < previous:
-            return max(latest, int(previous * 0.85))
-
-        growth = max(50_000, int(previous * 0.08))
-        return min(latest, previous + growth)
