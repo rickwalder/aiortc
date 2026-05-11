@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+
+from pycc import (
+    RTPFB_TRANSPORT_CC_FMT,
+    TRANSPORT_CC_URI,
+    GoogCcController,
+    LeakyBucketPacerModel,
+    PacerConfig,
+    SentPacket,
+    TargetRateUpdate,
+    TransportLayerCcPacket,
+    TwccRecorder,
+    uint16_add,
+)
+
+from .rtcrtpparameters import RTCRtcpFeedback, RTCRtpHeaderExtensionParameters
+
+RTCP_RTPFB = 205
+TRANSPORT_CC_HEADER_EXTENSION_ID = 5
+
+
+@dataclass(frozen=True)
+class TransportControlCapabilities:
+    rtcp_feedback: list[RTCRtcpFeedback]
+    rtp_header_extensions: list[RTCRtpHeaderExtensionParameters]
+    rtcp_feedback_formats: list[tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class TransportControlSentPacket:
+    transport_sequence_number: int
+    send_time_ms: int
+    size_bytes: int
+    ssrc: int
+    rtp_sequence_number: int
+    is_retransmission: bool = False
+
+
+@dataclass(frozen=True)
+class TransportControlTelemetry:
+    feedback_count: int = 0
+    packet_count: int = 0
+    received_count: int = 0
+    lost_count: int = 0
+    first_time_lost_count: int = 0
+    recovered_count: int = 0
+    data_in_flight_bytes: int = 0
+    last_feedback_time_us: int = 0
+    last_target_bitrate_bps: int = 0
+    last_update_reason: str = ""
+    last_loss_fraction: float = 0.0
+    last_rtt_us: int = 0
+
+
+def get_transport_control_capabilities(kind: str) -> TransportControlCapabilities:
+    if kind != "video":
+        return TransportControlCapabilities([], [], [])
+
+    return TransportControlCapabilities(
+        rtcp_feedback=[RTCRtcpFeedback(type="transport-cc")],
+        rtp_header_extensions=[
+            RTCRtpHeaderExtensionParameters(
+                id=TRANSPORT_CC_HEADER_EXTENSION_ID,
+                uri=TRANSPORT_CC_URI,
+            )
+        ],
+        rtcp_feedback_formats=[(RTCP_RTPFB, RTPFB_TRANSPORT_CC_FMT)],
+    )
+
+
+class PyccTransportControlProvider:
+    def __init__(self) -> None:
+        self._transport_sequence_number = 0
+        self._gcc = GoogCcController()
+        self._twcc_recorder: Optional[TwccRecorder] = None
+        self._twcc_feedback_ssrc: Optional[int] = None
+        self._active = False
+        self._feedback_count = 0
+        self._packet_count = 0
+        self._received_count = 0
+        self._lost_count = 0
+        self._first_time_lost_count = 0
+        self._recovered_count = 0
+        self._last_feedback_time_us = 0
+        self._last_update: TargetRateUpdate | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def packet_history(self):
+        return self._gcc.packet_history
+
+    def on_round_trip_time(self, rtt_us: int) -> None:
+        self._gcc.on_round_trip_time(rtt_us)
+
+    def next_transport_sequence_number(self) -> int:
+        sequence_number = self._transport_sequence_number
+        self._transport_sequence_number = uint16_add(
+            self._transport_sequence_number, 1
+        )
+        return sequence_number
+
+    def on_packet_sent(self, packet: TransportControlSentPacket) -> None:
+        self._gcc.on_packet_sent(
+            SentPacket(
+                transport_sequence_number=packet.transport_sequence_number,
+                send_time_us=packet.send_time_ms * 1000,
+                size_bytes=packet.size_bytes,
+                ssrc=packet.ssrc,
+                rtp_sequence_number=packet.rtp_sequence_number,
+                is_retransmission=packet.is_retransmission,
+            )
+        )
+
+    def observe_incoming_rtp(
+        self,
+        *,
+        media_ssrc: int,
+        transport_sequence_number: int,
+        arrival_time_us: int,
+        feedback_ssrc: int,
+    ) -> list[TransportLayerCcPacket]:
+        if (
+            self._twcc_recorder is None
+            or self._twcc_feedback_ssrc != feedback_ssrc
+        ):
+            self._twcc_recorder = TwccRecorder(sender_ssrc=feedback_ssrc)
+            self._twcc_feedback_ssrc = feedback_ssrc
+
+        self._twcc_recorder.record_packet(
+            media_ssrc=media_ssrc,
+            transport_sequence_number=transport_sequence_number,
+            arrival_time_us=arrival_time_us,
+        )
+        self._active = True
+        return self._twcc_recorder.build_feedback(arrival_time_us)
+
+    def handle_transport_feedback(
+        self, feedback: TransportLayerCcPacket, feedback_time_us: int
+    ) -> TargetRateUpdate | None:
+        normalized = self._gcc.packet_history.on_transport_feedback(
+            feedback, feedback_time_us
+        )
+        received = normalized.received_with_send_info()
+        lost = normalized.lost_with_send_info()
+        self._feedback_count += 1
+        self._packet_count += len(normalized.packet_results)
+        self._received_count += len(received)
+        self._lost_count += len(lost)
+        self._first_time_lost_count += sum(
+            1 for result in lost if result.reported_lost_for_first_time
+        )
+        self._recovered_count += sum(
+            1
+            for result in received
+            if result.reported_recovered_for_first_time
+        )
+        self._last_feedback_time_us = feedback_time_us
+
+        update = self._gcc.on_transport_feedback(normalized)
+        self._active = True
+        if update is not None:
+            self._last_update = update
+        return update
+
+    def get_pacer_config(self) -> PacerConfig:
+        return self._gcc.get_pacer_config()
+
+    def get_telemetry(self) -> TransportControlTelemetry:
+        update = self._last_update
+        return TransportControlTelemetry(
+            feedback_count=self._feedback_count,
+            packet_count=self._packet_count,
+            received_count=self._received_count,
+            lost_count=self._lost_count,
+            first_time_lost_count=self._first_time_lost_count,
+            recovered_count=self._recovered_count,
+            data_in_flight_bytes=self._gcc.packet_history.data_in_flight_bytes,
+            last_feedback_time_us=self._last_feedback_time_us,
+            last_target_bitrate_bps=self._gcc.get_target_bitrate(),
+            last_update_reason=update.reason if update is not None else "",
+            last_loss_fraction=update.loss_fraction if update is not None else 0.0,
+            last_rtt_us=update.rtt_us if update is not None else 0,
+        )
+
+
+class AsyncRtpPacer:
+    def __init__(self) -> None:
+        self._model: LeakyBucketPacerModel | None = None
+        self._lock = asyncio.Lock()
+
+    async def pace(self, *, size_bytes: int, config: PacerConfig, now_ms: int) -> None:
+        if size_bytes <= 0 or config.send_bitrate_bps <= 0:
+            return
+
+        async with self._lock:
+            now_us = now_ms * 1000
+            if self._model is None:
+                self._model = LeakyBucketPacerModel(config, now_us)
+            else:
+                self._model.set_config(config, now_us)
+
+            wait_us = self._wait_time_us(size_bytes, now_us)
+            if wait_us > 0:
+                await asyncio.sleep(wait_us / 1_000_000)
+                now_us += wait_us
+
+            self._model.on_packet_sent(size_bytes, now_us)
+
+    def _wait_time_us(self, size_bytes: int, now_us: int) -> int:
+        assert self._model is not None
+        self._model.update(now_us)
+        if self._model.can_send(size_bytes, now_us):
+            return 0
+
+        deficit_bytes = size_bytes - self._model.budget_bytes
+        if self._model.config.send_bitrate_bps <= 0:
+            return 0
+        return max(
+            0,
+            int(deficit_bytes * 8_000_000 / self._model.config.send_bitrate_bps),
+        )

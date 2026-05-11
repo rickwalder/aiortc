@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
 import math
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from .rate import RemoteBitrateEstimator
-from .rtp import RtcpPsfbPacket, RtpPacket, RTCP_PSFB_APP, pack_remb_fci
+from .rtp import (
+    RTCP_PSFB_APP,
+    AnyRtcpPacket,
+    RtcpPsfbPacket,
+    RtcpTransportLayerCcPacket,
+    RtpPacket,
+    pack_remb_fci,
+)
+from .transportcontrol import (
+    PyccTransportControlProvider,
+    TransportControlSentPacket,
+)
+
+logger = logging.getLogger(__name__)
+_TELEMETRY_INTERVAL_MS = 10_000
+_SIGNIFICANT_TARGET_DROP_RATIO = 0.25
 
 
 class CongestionControlledSender(Protocol):
@@ -52,9 +68,12 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
+        self.__transport_control = PyccTransportControlProvider()
+        self.__last_telemetry_ms: Optional[int] = None
+        self.__last_logged_target_bitrate: Optional[int] = None
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
-        if receiver.kind == "video":
+        if getattr(receiver, "kind", None) == "video":
             self.__receivers.add(receiver)
 
     def unregister_receiver(self, receiver: CongestionControlledReceiver) -> None:
@@ -85,6 +104,8 @@ class TransportCongestionController:
     def update_receiver_estimate(
         self, bitrate: int, ssrcs: list[int], now_ms: int
     ) -> None:
+        if self.__transport_control.active:
+            return
         if not self.__senders:
             return
 
@@ -103,12 +124,67 @@ class TransportCongestionController:
         if rtt_ms <= 0:
             return
         self.__remote_bitrate_estimator.rate_control.rtt = rtt_ms
+        self.__transport_control.on_round_trip_time(rtt_ms * 1000)
+
+    def next_transport_sequence_number(self) -> int:
+        return self.__transport_control.next_transport_sequence_number()
+
+    def on_packet_sent(
+        self,
+        *,
+        transport_sequence_number: int,
+        send_time_ms: int,
+        size_bytes: int,
+        ssrc: int,
+        rtp_sequence_number: int,
+        is_retransmission: bool = False,
+    ) -> None:
+        self.__transport_control.on_packet_sent(
+            TransportControlSentPacket(
+                transport_sequence_number=transport_sequence_number,
+                send_time_ms=send_time_ms,
+                size_bytes=size_bytes,
+                ssrc=ssrc,
+                rtp_sequence_number=rtp_sequence_number,
+                is_retransmission=is_retransmission,
+            )
+        )
+
+    def handle_transport_feedback(
+        self, packet: RtcpTransportLayerCcPacket, now_ms: int
+    ) -> None:
+        update = self.__transport_control.handle_transport_feedback(
+            packet.feedback, now_ms * 1000
+        )
+        if update is not None:
+            previous_target = self.__session_target_bitrate
+            self.__session_target_bitrate = update.target_bitrate_bps
+            self.__recompute_allocation()
+            self.__log_target_update(previous_target, update)
+        self.__log_telemetry(now_ms)
+
+    def get_pacer_config(self):
+        return self.__transport_control.get_pacer_config()
 
     def observe_incoming_rtp(
-        self, receiver: CongestionControlledReceiver, packet: RtpPacket, arrival_time_ms: int
-    ) -> Optional[RtcpPsfbPacket]:
-        if receiver.kind != "video" or packet.extensions.abs_send_time is None:
-            return None
+        self,
+        receiver: CongestionControlledReceiver,
+        packet: RtpPacket,
+        arrival_time_ms: int,
+    ) -> list[AnyRtcpPacket]:
+        feedback: list[AnyRtcpPacket] = []
+        if packet.extensions.transport_sequence_number is not None:
+            feedback.extend(
+                self.__observe_incoming_transport_cc(receiver, packet, arrival_time_ms)
+            )
+
+        if (
+            getattr(receiver, "kind", None) != "video"
+            or packet.extensions.abs_send_time is None
+        ):
+            return feedback
+        if self.__transport_control.active:
+            return feedback
 
         remb = self.__remote_bitrate_estimator.add(
             abs_send_time=packet.extensions.abs_send_time,
@@ -117,20 +193,44 @@ class TransportCongestionController:
             ssrc=packet.ssrc,
         )
         if remb is None:
-            return None
+            return feedback
 
         feedback_ssrc = self.__get_feedback_ssrc()
         if feedback_ssrc is None:
-            return None
+            return feedback
 
         bitrate, ssrcs = remb
 
-        return RtcpPsfbPacket(
-            fmt=RTCP_PSFB_APP,
-            ssrc=feedback_ssrc,
-            media_ssrc=0,
-            fci=pack_remb_fci(bitrate, ssrcs),
+        feedback.append(
+            RtcpPsfbPacket(
+                fmt=RTCP_PSFB_APP,
+                ssrc=feedback_ssrc,
+                media_ssrc=0,
+                fci=pack_remb_fci(bitrate, ssrcs),
+            )
         )
+        return feedback
+
+    def __observe_incoming_transport_cc(
+        self,
+        receiver: CongestionControlledReceiver,
+        packet: RtpPacket,
+        arrival_time_ms: int,
+    ) -> list[RtcpTransportLayerCcPacket]:
+        feedback_ssrc = self.__get_feedback_ssrc()
+        if feedback_ssrc is None or packet.extensions.transport_sequence_number is None:
+            return []
+
+        feedback_packets = self.__transport_control.observe_incoming_rtp(
+            media_ssrc=packet.ssrc,
+            transport_sequence_number=packet.extensions.transport_sequence_number,
+            arrival_time_us=arrival_time_ms * 1000,
+            feedback_ssrc=feedback_ssrc,
+        )
+        return [
+            RtcpTransportLayerCcPacket(feedback=feedback)
+            for feedback in feedback_packets
+        ]
 
     def __derive_session_target(self, now_ms: int) -> Optional[int]:
         active_ssrcs = list(self.__senders.keys())
@@ -178,7 +278,8 @@ class TransportCongestionController:
             return
 
         allocatable = {
-            state.sender._ssrc: state.max_bitrate - state.min_bitrate for state in states
+            state.sender._ssrc: state.max_bitrate - state.min_bitrate
+            for state in states
         }
         active_states = [
             state for state in states if allocatable[state.sender._ssrc] > 0
@@ -204,7 +305,9 @@ class TransportCongestionController:
 
             leftover = round_remaining - distributed
             if leftover > 0:
-                for _, state in sorted(remainders, key=lambda item: item[0], reverse=True):
+                for _, state in sorted(
+                    remainders, key=lambda item: item[0], reverse=True
+                ):
                     room = allocatable[state.sender._ssrc]
                     grant = grants[state.sender._ssrc]
                     if room <= grant:
@@ -257,3 +360,90 @@ class TransportCongestionController:
             if ssrc is not None:
                 return ssrc
         return None
+
+    def __log_target_update(self, previous_target, update) -> None:
+        previous = (
+            previous_target
+            if previous_target is not None
+            else self.__last_logged_target_bitrate
+        )
+        if update.reason == "increase":
+            logger.debug(
+                "transport-cc target update target_bps=%d stable_bps=%d "
+                "reason=%s loss=%.3f rtt_ms=%.1f",
+                update.target_bitrate_bps,
+                update.stable_target_bitrate_bps,
+                update.reason,
+                update.loss_fraction,
+                update.rtt_us / 1000,
+            )
+            self.__last_logged_target_bitrate = update.target_bitrate_bps
+            return
+
+        level = logging.INFO
+        if (
+            previous is not None
+            and previous > 0
+            and update.target_bitrate_bps
+            < previous * (1.0 - _SIGNIFICANT_TARGET_DROP_RATIO)
+        ):
+            level = logging.WARNING
+
+        logger.log(
+            level,
+            "transport-cc target update target_bps=%d stable_bps=%d "
+            "reason=%s loss=%.3f rtt_ms=%.1f",
+            update.target_bitrate_bps,
+            update.stable_target_bitrate_bps,
+            update.reason,
+            update.loss_fraction,
+            update.rtt_us / 1000,
+        )
+        self.__last_logged_target_bitrate = update.target_bitrate_bps
+
+    def __log_telemetry(self, now_ms: int) -> None:
+        if (
+            self.__last_telemetry_ms is not None
+            and now_ms - self.__last_telemetry_ms < _TELEMETRY_INTERVAL_MS
+        ):
+            return
+        self.__last_telemetry_ms = now_ms
+
+        telemetry = self.__transport_control.get_telemetry()
+        if telemetry.feedback_count <= 0:
+            return
+
+        pacer = self.__transport_control.get_pacer_config()
+        sender_states = []
+        for state in self.__senders.values():
+            sender_states.append(
+                "%d:alloc=%d applied=%s encoder=%s"
+                % (
+                    state.sender._ssrc,
+                    state.allocated_bitrate,
+                    state.applied_bitrate,
+                    state.sender._get_target_bitrate(),
+                )
+            )
+
+        loss_fraction = (
+            telemetry.first_time_lost_count / telemetry.packet_count
+            if telemetry.packet_count
+            else 0.0
+        )
+        logger.info(
+            "transport-cc telemetry feedbacks=%d packets=%d received=%d "
+            "lost=%d first_lost=%d recovered=%d loss=%.3f "
+            "target_bps=%d pacer_bps=%d in_flight=%d senders=[%s]",
+            telemetry.feedback_count,
+            telemetry.packet_count,
+            telemetry.received_count,
+            telemetry.lost_count,
+            telemetry.first_time_lost_count,
+            telemetry.recovered_count,
+            loss_fraction,
+            telemetry.last_target_bitrate_bps,
+            pacer.send_bitrate_bps,
+            telemetry.data_in_flight_bytes,
+            "; ".join(sender_states),
+        )

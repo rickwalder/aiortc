@@ -9,6 +9,7 @@ from ..rtcrtpparameters import (
     RTCRtpHeaderExtensionCapability,
     RTCRtpHeaderExtensionParameters,
 )
+from ..transportcontrol import get_transport_control_capabilities
 from .base import Decoder, Encoder
 from .g711 import PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder
 from .g722 import G722Decoder, G722Encoder
@@ -58,6 +59,7 @@ HEADER_EXTENSIONS: dict[str, list[RTCRtpHeaderExtensionParameters]] = {
         RTCRtpHeaderExtensionParameters(
             id=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
         ),
+        *get_transport_control_capabilities("video").rtp_header_extensions,
     ],
 }
 
@@ -80,6 +82,7 @@ def init_codecs() -> None:
                     RTCRtcpFeedback(type="nack"),
                     RTCRtcpFeedback(type="nack", parameter="pli"),
                     RTCRtcpFeedback(type="goog-remb"),
+                    *get_transport_control_capabilities("video").rtcp_feedback,
                 ],
                 parameters=parameters or {},
             ),

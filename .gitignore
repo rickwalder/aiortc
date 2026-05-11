@@ -9,6 +9,7 @@
 /build
 /dist
 /docs/_build
+reference-materials-dont-commit/
 
 # Environments
 .env

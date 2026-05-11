@@ -3,6 +3,7 @@ import io
 from contextlib import redirect_stderr
 from unittest import TestCase
 
+import av
 from aiortc.codecs import get_decoder, get_encoder
 from aiortc.codecs.vpx import (
     Vp8Decoder,
@@ -193,6 +194,14 @@ class Vp8Test(CodecTestCase):
         self.assertEqual(len(payloads), 1)
         self.assertTrue(len(payloads[0]) < 1300)
         self.assertEqual(timestamp, 0)
+
+    def test_encoder_resets_picture_type(self) -> None:
+        encoder = self.ensureIsInstance(get_encoder(VP8_CODEC), Vp8Encoder)
+
+        frame = self.create_video_frame(width=640, height=480, pts=0)
+        frame.pict_type = av.video.frame.PictureType.I
+        encoder.encode(frame)
+        self.assertEqual(frame.pict_type, av.video.frame.PictureType.NONE)
 
     def test_encoder_pack(self) -> None:
         encoder = self.ensureIsInstance(get_encoder(VP8_CODEC), Vp8Encoder)

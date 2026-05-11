@@ -30,6 +30,7 @@ dependencies = [
     "cryptography>=44.0.0",
     "google-crc32c>=1.1",
     "pyee>=13.0.0",
+    "pycc",
     "pylibsrtp>=0.10.0",
     "pyopenssl>=25.0.0",
 ]
@@ -72,6 +73,9 @@ select = [
 
 [tool.ruff.lint.isort]
 known-third-party = ["aiortc"]
+
+[tool.uv.sources]
+pycc = { git = "ssh://git@github.com/Weave-Robotics/pycc.git", rev = "main" }
 
 [tool.setuptools.dynamic]
 version = {attr = "aiortc.__version__"}

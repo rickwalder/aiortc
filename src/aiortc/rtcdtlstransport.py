@@ -617,6 +617,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             return
 
         for packet in packets:
+            if isinstance(packet, rtp.RtcpTransportLayerCcPacket):
+                self._congestion_controller.handle_transport_feedback(
+                    packet, clock.current_ms()
+                )
             if isinstance(packet, RtcpPsfbPacket) and packet.fmt == rtp.RTCP_PSFB_APP:
                 try:
                     bitrate, ssrcs = rtp.unpack_remb_fci(packet.fci)
@@ -640,12 +644,12 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         # route RTP packet
         receiver = self._rtp_router.route_rtp(packet)
         if receiver is not None:
-            remb = self._congestion_controller.observe_incoming_rtp(
+            feedback_packets = self._congestion_controller.observe_incoming_rtp(
                 receiver, packet, arrival_time_ms
             )
-            if remb is not None:
+            for feedback_packet in feedback_packets:
                 try:
-                    await self._send_rtp(bytes(remb))
+                    await self._send_rtp(bytes(feedback_packet))
                 except ConnectionError:
                     pass
             await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
