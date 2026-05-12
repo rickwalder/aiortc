@@ -64,6 +64,20 @@ class TransportControlTelemetry:
     last_update_reason: str = ""
     last_loss_fraction: float = 0.0
     last_rtt_us: int = 0
+    delay_usage: str = "normal"
+    aimd_state: str = "increase"
+    acked_bitrate_bps: int = 0
+    loss_sample: float = 0.0
+    loss_average: float = 0.0
+    trend_ms: float = 0.0
+    trend_threshold_ms: float = 0.0
+    overuse_counter: int = 0
+    overuse_time_ms: float = 0.0
+    groups_seen: int = 0
+    last_group_bytes: int = 0
+    last_send_delta_ms: float = 0.0
+    last_receive_delta_ms: float = 0.0
+    last_delay_delta_ms: float = 0.0
 
 
 def get_transport_control_capabilities(kind: str) -> TransportControlCapabilities:
@@ -199,6 +213,7 @@ class PyccTransportControlProvider:
     def get_telemetry(self) -> TransportControlTelemetry:
         update = self._last_update
         packet_history = self._gcc.packet_history
+        diagnostics = self._gcc.get_diagnostics()
         oldest_in_flight_send_time_us = packet_history.oldest_in_flight_send_time_us
         if oldest_in_flight_send_time_us is None:
             oldest_in_flight_age_ms = 0
@@ -235,6 +250,20 @@ class PyccTransportControlProvider:
             last_update_reason=update.reason if update is not None else "",
             last_loss_fraction=update.loss_fraction if update is not None else 0.0,
             last_rtt_us=update.rtt_us if update is not None else 0,
+            delay_usage=diagnostics.delay_usage,
+            aimd_state=diagnostics.aimd_state,
+            acked_bitrate_bps=diagnostics.acked_bitrate_bps or 0,
+            loss_sample=diagnostics.loss_sample,
+            loss_average=diagnostics.loss_average,
+            trend_ms=diagnostics.trend_ms,
+            trend_threshold_ms=diagnostics.trend_threshold_ms,
+            overuse_counter=diagnostics.overuse_counter,
+            overuse_time_ms=diagnostics.overuse_time_us / 1000,
+            groups_seen=diagnostics.groups_seen,
+            last_group_bytes=diagnostics.last_group_bytes,
+            last_send_delta_ms=diagnostics.last_send_delta_us / 1000,
+            last_receive_delta_ms=diagnostics.last_receive_delta_us / 1000,
+            last_delay_delta_ms=diagnostics.last_delay_delta_ms,
         )
 
 

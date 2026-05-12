@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -22,7 +23,9 @@ from .transportcontrol import (
 )
 
 logger = logging.getLogger(__name__)
-_TELEMETRY_INTERVAL_MS = 10_000
+_TELEMETRY_INTERVAL_MS = int(
+    os.environ.get("AIORTC_TRANSPORT_CC_TELEMETRY_INTERVAL_MS", "10000")
+)
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
 _TRANSPORT_MIN_BITRATE = 1_500_000
 _TRANSPORT_START_BITRATE = 1_500_000
@@ -91,6 +94,7 @@ class TransportCongestionController:
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
+        self.__last_logged_delay_usage: Optional[str] = None
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
         if getattr(receiver, "kind", None) == "video":
@@ -181,6 +185,7 @@ class TransportCongestionController:
             self.__session_target_bitrate = update.target_bitrate_bps
             self.__recompute_allocation()
             self.__log_target_update(previous_target, update)
+        self.__log_delay_usage_transition()
         self.__log_telemetry(now_ms)
 
     def get_pacer_config(self):
@@ -382,6 +387,7 @@ class TransportCongestionController:
         return None
 
     def __log_target_update(self, previous_target, update) -> None:
+        telemetry = self.__transport_control.get_telemetry()
         previous = (
             previous_target
             if previous_target is not None
@@ -390,12 +396,25 @@ class TransportCongestionController:
         if update.reason == "increase":
             logger.debug(
                 "transport-cc target update target_bps=%d stable_bps=%d "
-                "reason=%s loss=%.3f rtt_ms=%.1f",
+                "previous_bps=%s reason=%s delay_usage=%s aimd=%s acked_bps=%d "
+                "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+                "trend_ms=%.3f threshold_ms=%.3f send_delta_ms=%.3f "
+                "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
                 update.target_bitrate_bps,
                 update.stable_target_bitrate_bps,
+                previous,
                 update.reason,
+                telemetry.delay_usage,
+                telemetry.aimd_state,
+                telemetry.acked_bitrate_bps,
                 update.loss_fraction,
                 update.rtt_us / 1000,
+                telemetry.trend_ms,
+                telemetry.trend_threshold_ms,
+                telemetry.last_send_delta_ms,
+                telemetry.last_receive_delta_ms,
+                telemetry.last_delay_delta_ms,
+                telemetry.last_group_bytes,
             )
             self.__last_logged_target_bitrate = update.target_bitrate_bps
             return
@@ -411,15 +430,60 @@ class TransportCongestionController:
 
         logger.log(
             level,
-            "transport-cc target update target_bps=%d stable_bps=%d "
-            "reason=%s loss=%.3f rtt_ms=%.1f",
+            "transport-cc target update target_bps=%d stable_bps=%d previous_bps=%s "
+            "reason=%s delay_usage=%s aimd=%s acked_bps=%d "
+            "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+            "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
+            "overuse_time_ms=%.3f send_delta_ms=%.3f recv_delta_ms=%.3f "
+            "delay_delta_ms=%.3f group_bytes=%d",
             update.target_bitrate_bps,
             update.stable_target_bitrate_bps,
+            previous,
             update.reason,
+            telemetry.delay_usage,
+            telemetry.aimd_state,
+            telemetry.acked_bitrate_bps,
             update.loss_fraction,
+            telemetry.loss_sample,
             update.rtt_us / 1000,
+            telemetry.trend_ms,
+            telemetry.trend_threshold_ms,
+            telemetry.overuse_counter,
+            telemetry.overuse_time_ms,
+            telemetry.last_send_delta_ms,
+            telemetry.last_receive_delta_ms,
+            telemetry.last_delay_delta_ms,
+            telemetry.last_group_bytes,
         )
         self.__last_logged_target_bitrate = update.target_bitrate_bps
+
+    def __log_delay_usage_transition(self) -> None:
+        telemetry = self.__transport_control.get_telemetry()
+        usage = telemetry.delay_usage
+        previous = self.__last_logged_delay_usage
+        if usage == previous:
+            return
+        self.__last_logged_delay_usage = usage
+        level = logging.INFO if usage != "normal" else logging.DEBUG
+        logger.log(
+            level,
+            "transport-cc delay state %s -> %s trend_ms=%.3f threshold_ms=%.3f "
+            "overuse_count=%d overuse_time_ms=%.3f acked_bps=%d "
+            "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
+            "group_bytes=%d groups=%d",
+            previous or "unknown",
+            usage,
+            telemetry.trend_ms,
+            telemetry.trend_threshold_ms,
+            telemetry.overuse_counter,
+            telemetry.overuse_time_ms,
+            telemetry.acked_bitrate_bps,
+            telemetry.last_send_delta_ms,
+            telemetry.last_receive_delta_ms,
+            telemetry.last_delay_delta_ms,
+            telemetry.last_group_bytes,
+            telemetry.groups_seen,
+        )
 
     def __log_telemetry(self, now_ms: int) -> None:
         if (
@@ -506,7 +570,12 @@ class TransportCongestionController:
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
             "floor_limited=%s sent_bps=%d acked_bps=%d lost_bps=%d "
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
-            "twcc_next=%d fb_base=%d fb_count=%d senders=[%s]",
+            "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
+            "acked_estimate_bps=%d loss_sample=%.3f loss_avg=%.3f "
+            "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
+            "overuse_time_ms=%.3f groups=%d group_bytes=%d "
+            "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
+            "senders=[%s]",
             telemetry.feedback_count,
             telemetry.packet_count,
             telemetry.received_count,
@@ -531,5 +600,19 @@ class TransportCongestionController:
             telemetry.next_transport_sequence_number,
             telemetry.last_feedback_base_sequence_number,
             telemetry.last_feedback_packet_count,
+            telemetry.delay_usage,
+            telemetry.aimd_state,
+            telemetry.acked_bitrate_bps,
+            telemetry.loss_sample,
+            telemetry.loss_average,
+            telemetry.trend_ms,
+            telemetry.trend_threshold_ms,
+            telemetry.overuse_counter,
+            telemetry.overuse_time_ms,
+            telemetry.groups_seen,
+            telemetry.last_group_bytes,
+            telemetry.last_send_delta_ms,
+            telemetry.last_receive_delta_ms,
+            telemetry.last_delay_delta_ms,
             "; ".join(sender_states),
         )

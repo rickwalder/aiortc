@@ -176,6 +176,9 @@ class AsyncRtpPacerTest(TestCase):
         self.assertEqual(telemetry.last_feedback_base_sequence_number, sequence_number)
         self.assertEqual(telemetry.last_feedback_packet_count, 1)
         self.assertGreater(telemetry.last_target_bitrate_bps, 0)
+        self.assertIn(telemetry.delay_usage, ["normal", "underuse", "overuse"])
+        self.assertGreaterEqual(telemetry.trend_threshold_ms, 0)
+        self.assertGreaterEqual(telemetry.groups_seen, 0)
 
 
 class TransportCongestionControllerTest(TestCase):
