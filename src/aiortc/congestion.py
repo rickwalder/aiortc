@@ -20,6 +20,7 @@ from .transportcontrol import (
     PyccTransportControlProvider,
     TransportControlSentPacket,
 )
+from .transporttrace import TransportCcTraceWriter
 
 logger = logging.getLogger(__name__)
 _TELEMETRY_INTERVAL_MS = int(
@@ -79,7 +80,10 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
-        self.__transport_control = PyccTransportControlProvider()
+        self.__trace_writer = TransportCcTraceWriter.from_environment()
+        self.__transport_control = PyccTransportControlProvider(
+            trace_writer=self.__trace_writer
+        )
         self.__rtp_pacer = AsyncRtpPacer()
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
@@ -156,6 +160,7 @@ class TransportCongestionController:
                 transport_sequence_number=transport_sequence_number,
                 send_time_us=send_time_us,
                 size_bytes=size_bytes,
+                payload_size_bytes=payload_size_bytes,
                 ssrc=ssrc,
                 rtp_sequence_number=rtp_sequence_number,
                 is_retransmission=is_retransmission,
@@ -179,6 +184,7 @@ class TransportCongestionController:
         if update is not None:
             self.__recompute_allocation()
             self.__log_target_update(previous_target, update)
+            self.__trace_target_update(previous_target, update)
         self.__log_delay_usage_transition()
         self.__log_telemetry(now_us // 1000)
 
@@ -430,6 +436,15 @@ class TransportCongestionController:
             telemetry.last_group_bytes,
         )
         self.__last_logged_target_bitrate = update.target_bitrate_bps
+
+    def __trace_target_update(self, previous_target, update) -> None:
+        if self.__trace_writer is None:
+            return
+        self.__trace_writer.write_target_update(
+            previous_target=previous_target,
+            update=update,
+            telemetry=self.__transport_control.get_telemetry(),
+        )
 
     def __log_delay_usage_transition(self) -> None:
         telemetry = self.__transport_control.get_telemetry()

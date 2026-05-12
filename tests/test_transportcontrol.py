@@ -1,3 +1,5 @@
+import json
+import tempfile
 from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +14,7 @@ from aiortc.transportcontrol import (
     TransportControlSentPacket,
     get_transport_control_capabilities,
 )
+from aiortc.transporttrace import TransportCcTraceWriter
 from pycc import RTPFB_TRANSPORT_CC_FMT, TRANSPORT_CC_URI
 from pycc.types import PacerConfig, ProbeClusterConfig
 
@@ -223,6 +226,44 @@ class AsyncRtpPacerTest(TestCase):
         self.assertIn(telemetry.delay_usage, ["normal", "underuse", "overuse"])
         self.assertGreaterEqual(telemetry.trend_threshold_ms, 0)
         self.assertGreaterEqual(telemetry.groups_seen, 0)
+
+    def test_trace_writer_records_sent_and_feedback(self) -> None:
+        with tempfile.NamedTemporaryFile() as fp:
+            trace_writer = TransportCcTraceWriter(fp.name)
+            provider = PyccTransportControlProvider(trace_writer=trace_writer)
+            sequence_number = provider.next_transport_sequence_number()
+            provider.on_packet_sent(
+                TransportControlSentPacket(
+                    transport_sequence_number=sequence_number,
+                    send_time_us=10_000,
+                    size_bytes=1000,
+                    payload_size_bytes=900,
+                    ssrc=1234,
+                    rtp_sequence_number=99,
+                )
+            )
+            feedback = provider.observe_incoming_rtp(
+                media_ssrc=1234,
+                transport_sequence_number=sequence_number,
+                arrival_time_us=20_000,
+                feedback_ssrc=4321,
+            )[0]
+
+            provider.handle_transport_feedback(feedback, feedback_time_us=30_000)
+            trace_writer.close()
+
+            records = [
+                json.loads(line)
+                for line in fp.file.read().decode("utf-8").splitlines()
+            ]
+
+        self.assertEqual(records[0]["type"], "trace-start")
+        self.assertEqual(records[1]["type"], "sent")
+        self.assertEqual(records[1]["transport_sequence_number"], sequence_number)
+        self.assertEqual(records[1]["payload_size_bytes"], 900)
+        self.assertEqual(records[2]["type"], "feedback")
+        self.assertEqual(records[2]["base_sequence_number"], sequence_number)
+        self.assertEqual(records[2]["packets"][0][0], sequence_number)
 
 
 class TransportCongestionControllerTest(TestCase):

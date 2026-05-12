@@ -21,6 +21,7 @@ from pycc import (
 
 from . import clock
 from .rtcrtpparameters import RTCRtcpFeedback, RTCRtpHeaderExtensionParameters
+from .transporttrace import TransportCcTraceWriter
 
 RTCP_RTPFB = 205
 TRANSPORT_CC_HEADER_EXTENSION_ID = 5
@@ -40,6 +41,7 @@ class TransportControlSentPacket:
     size_bytes: int
     ssrc: int
     rtp_sequence_number: int
+    payload_size_bytes: int = 0
     is_retransmission: bool = False
     pacing_info: PacedPacketInfo | None = None
 
@@ -118,9 +120,14 @@ def get_transport_control_capabilities(kind: str) -> TransportControlCapabilitie
 
 
 class PyccTransportControlProvider:
-    def __init__(self, constraints: RateConstraints | None = None) -> None:
+    def __init__(
+        self,
+        constraints: RateConstraints | None = None,
+        trace_writer: TransportCcTraceWriter | None = None,
+    ) -> None:
         self._transport_sequence_number = 0
         self._gcc = GoogCcController(constraints)
+        self._trace_writer = trace_writer
         self._twcc_recorder: Optional[TwccRecorder] = None
         self._twcc_feedback_ssrc: Optional[int] = None
         self._active = False
@@ -176,6 +183,8 @@ class PyccTransportControlProvider:
                 ),
             )
         )
+        if self._trace_writer is not None:
+            self._trace_writer.write_sent(packet)
 
     def observe_incoming_rtp(
         self,
@@ -206,6 +215,8 @@ class PyccTransportControlProvider:
         normalized = self._gcc.packet_history.on_transport_feedback(
             feedback, feedback_time_us
         )
+        if self._trace_writer is not None:
+            self._trace_writer.write_feedback(feedback=feedback, normalized=normalized)
         received = normalized.received_with_send_info()
         lost = normalized.lost_with_send_info()
         self._feedback_count += 1
