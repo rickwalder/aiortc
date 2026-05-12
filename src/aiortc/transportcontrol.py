@@ -10,6 +10,7 @@ from pycc import (
     GoogCcController,
     LeakyBucketPacerModel,
     PacerConfig,
+    RateConstraints,
     SentPacket,
     TargetRateUpdate,
     TransportLayerCcPacket,
@@ -48,7 +49,16 @@ class TransportControlTelemetry:
     lost_count: int = 0
     first_time_lost_count: int = 0
     recovered_count: int = 0
+    sent_packet_count: int = 0
+    sent_bytes: int = 0
+    acknowledged_bytes: int = 0
+    lost_bytes: int = 0
     data_in_flight_bytes: int = 0
+    oldest_in_flight_age_ms: int = 0
+    packet_history_size: int = 0
+    next_transport_sequence_number: int = 0
+    last_feedback_base_sequence_number: int = 0
+    last_feedback_packet_count: int = 0
     last_feedback_time_us: int = 0
     last_target_bitrate_bps: int = 0
     last_update_reason: str = ""
@@ -73,9 +83,9 @@ def get_transport_control_capabilities(kind: str) -> TransportControlCapabilitie
 
 
 class PyccTransportControlProvider:
-    def __init__(self) -> None:
+    def __init__(self, constraints: RateConstraints | None = None) -> None:
         self._transport_sequence_number = 0
-        self._gcc = GoogCcController()
+        self._gcc = GoogCcController(constraints)
         self._twcc_recorder: Optional[TwccRecorder] = None
         self._twcc_feedback_ssrc: Optional[int] = None
         self._active = False
@@ -85,7 +95,13 @@ class PyccTransportControlProvider:
         self._lost_count = 0
         self._first_time_lost_count = 0
         self._recovered_count = 0
+        self._sent_packet_count = 0
+        self._sent_bytes = 0
+        self._acknowledged_bytes = 0
+        self._lost_bytes = 0
         self._last_feedback_time_us = 0
+        self._last_feedback_base_sequence_number = 0
+        self._last_feedback_packet_count = 0
         self._last_update: TargetRateUpdate | None = None
 
     @property
@@ -107,6 +123,8 @@ class PyccTransportControlProvider:
         return sequence_number
 
     def on_packet_sent(self, packet: TransportControlSentPacket) -> None:
+        self._sent_packet_count += 1
+        self._sent_bytes += packet.size_bytes
         self._gcc.on_packet_sent(
             SentPacket(
                 transport_sequence_number=packet.transport_sequence_number,
@@ -153,6 +171,10 @@ class PyccTransportControlProvider:
         self._packet_count += len(normalized.packet_results)
         self._received_count += len(received)
         self._lost_count += len(lost)
+        self._acknowledged_bytes += sum(
+            result.sent_packet.size_bytes for result in received
+        )
+        self._lost_bytes += sum(result.sent_packet.size_bytes for result in lost)
         self._first_time_lost_count += sum(
             1 for result in lost if result.reported_lost_for_first_time
         )
@@ -162,6 +184,8 @@ class PyccTransportControlProvider:
             if result.reported_recovered_for_first_time
         )
         self._last_feedback_time_us = feedback_time_us
+        self._last_feedback_base_sequence_number = feedback.base_sequence_number
+        self._last_feedback_packet_count = len(feedback.packets)
 
         update = self._gcc.on_transport_feedback(normalized)
         self._active = True
@@ -174,6 +198,21 @@ class PyccTransportControlProvider:
 
     def get_telemetry(self) -> TransportControlTelemetry:
         update = self._last_update
+        packet_history = self._gcc.packet_history
+        oldest_in_flight_send_time_us = packet_history.oldest_in_flight_send_time_us
+        if oldest_in_flight_send_time_us is None:
+            oldest_in_flight_age_ms = 0
+        else:
+            oldest_in_flight_age_ms = max(
+                0,
+                int(
+                    (
+                        self._last_feedback_time_us
+                        - oldest_in_flight_send_time_us
+                    )
+                    / 1000
+                ),
+            )
         return TransportControlTelemetry(
             feedback_count=self._feedback_count,
             packet_count=self._packet_count,
@@ -181,7 +220,16 @@ class PyccTransportControlProvider:
             lost_count=self._lost_count,
             first_time_lost_count=self._first_time_lost_count,
             recovered_count=self._recovered_count,
-            data_in_flight_bytes=self._gcc.packet_history.data_in_flight_bytes,
+            sent_packet_count=self._sent_packet_count,
+            sent_bytes=self._sent_bytes,
+            acknowledged_bytes=self._acknowledged_bytes,
+            lost_bytes=self._lost_bytes,
+            data_in_flight_bytes=packet_history.data_in_flight_bytes,
+            oldest_in_flight_age_ms=oldest_in_flight_age_ms,
+            packet_history_size=packet_history.history_size,
+            next_transport_sequence_number=self._transport_sequence_number,
+            last_feedback_base_sequence_number=self._last_feedback_base_sequence_number,
+            last_feedback_packet_count=self._last_feedback_packet_count,
             last_feedback_time_us=self._last_feedback_time_us,
             last_target_bitrate_bps=self._gcc.get_target_bitrate(),
             last_update_reason=update.reason if update is not None else "",

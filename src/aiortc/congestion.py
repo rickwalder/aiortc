@@ -5,6 +5,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from pycc import RateConstraints
+
 from .rate import RemoteBitrateEstimator
 from .rtp import (
     RTCP_PSFB_APP,
@@ -22,6 +24,9 @@ from .transportcontrol import (
 logger = logging.getLogger(__name__)
 _TELEMETRY_INTERVAL_MS = 10_000
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
+_TRANSPORT_MIN_BITRATE = 1_500_000
+_TRANSPORT_START_BITRATE = 1_500_000
+_TRANSPORT_MAX_BITRATE = 9_000_000
 
 
 class CongestionControlledSender(Protocol):
@@ -51,6 +56,14 @@ class SenderState:
     applied_bitrate: Optional[int] = None
 
 
+@dataclass
+class TelemetrySnapshot:
+    now_ms: int
+    sent_bytes: int
+    acknowledged_bytes: int
+    lost_bytes: int
+
+
 class TransportCongestionController:
     """
     Lightweight transport-scoped overlay congestion controller.
@@ -68,8 +81,15 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
-        self.__transport_control = PyccTransportControlProvider()
+        self.__transport_control = PyccTransportControlProvider(
+            RateConstraints(
+                min_bitrate_bps=_TRANSPORT_MIN_BITRATE,
+                start_bitrate_bps=_TRANSPORT_START_BITRATE,
+                max_bitrate_bps=_TRANSPORT_MAX_BITRATE,
+            )
+        )
         self.__last_telemetry_ms: Optional[int] = None
+        self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
@@ -414,8 +434,56 @@ class TransportCongestionController:
             return
 
         pacer = self.__transport_control.get_pacer_config()
+        states = list(self.__senders.values())
+        allocation_floor = sum(state.min_bitrate for state in states)
+        allocation_ceiling = sum(state.max_bitrate for state in states)
+        allocated_total = sum(state.allocated_bitrate for state in states)
+        applied_total = sum(
+            state.applied_bitrate or 0 for state in states
+        )
+        encoder_total = sum(
+            state.sender._get_target_bitrate() or 0 for state in states
+        )
+        floor_limited = (
+            self.__session_target_bitrate is not None
+            and self.__session_target_bitrate < allocation_floor
+        )
+
+        if self.__last_telemetry_snapshot is None:
+            elapsed_s = 0.0
+            sent_rate_bps = 0
+            acked_rate_bps = 0
+            lost_rate_bps = 0
+        else:
+            elapsed_ms = now_ms - self.__last_telemetry_snapshot.now_ms
+            elapsed_s = max(0.001, elapsed_ms / 1000)
+            sent_rate_bps = int(
+                (telemetry.sent_bytes - self.__last_telemetry_snapshot.sent_bytes)
+                * 8
+                / elapsed_s
+            )
+            acked_rate_bps = int(
+                (
+                    telemetry.acknowledged_bytes
+                    - self.__last_telemetry_snapshot.acknowledged_bytes
+                )
+                * 8
+                / elapsed_s
+            )
+            lost_rate_bps = int(
+                (telemetry.lost_bytes - self.__last_telemetry_snapshot.lost_bytes)
+                * 8
+                / elapsed_s
+            )
+        self.__last_telemetry_snapshot = TelemetrySnapshot(
+            now_ms=now_ms,
+            sent_bytes=telemetry.sent_bytes,
+            acknowledged_bytes=telemetry.acknowledged_bytes,
+            lost_bytes=telemetry.lost_bytes,
+        )
+
         sender_states = []
-        for state in self.__senders.values():
+        for state in states:
             sender_states.append(
                 "%d:alloc=%d applied=%s encoder=%s"
                 % (
@@ -434,7 +502,11 @@ class TransportCongestionController:
         logger.info(
             "transport-cc telemetry feedbacks=%d packets=%d received=%d "
             "lost=%d first_lost=%d recovered=%d loss=%.3f "
-            "target_bps=%d pacer_bps=%d in_flight=%d senders=[%s]",
+            "target_bps=%d pacer_bps=%d floor_bps=%d ceiling_bps=%d "
+            "allocated_bps=%d applied_bps=%d encoder_bps=%d "
+            "floor_limited=%s sent_bps=%d acked_bps=%d lost_bps=%d "
+            "in_flight=%d oldest_in_flight_ms=%d history=%d "
+            "twcc_next=%d fb_base=%d fb_count=%d senders=[%s]",
             telemetry.feedback_count,
             telemetry.packet_count,
             telemetry.received_count,
@@ -444,6 +516,20 @@ class TransportCongestionController:
             loss_fraction,
             telemetry.last_target_bitrate_bps,
             pacer.send_bitrate_bps,
+            allocation_floor,
+            allocation_ceiling,
+            allocated_total,
+            applied_total,
+            encoder_total,
+            floor_limited,
+            sent_rate_bps,
+            acked_rate_bps,
+            lost_rate_bps,
             telemetry.data_in_flight_bytes,
+            telemetry.oldest_in_flight_age_ms,
+            telemetry.packet_history_size,
+            telemetry.next_transport_sequence_number,
+            telemetry.last_feedback_base_sequence_number,
+            telemetry.last_feedback_packet_count,
             "; ".join(sender_states),
         )

@@ -169,6 +169,12 @@ class AsyncRtpPacerTest(TestCase):
         self.assertEqual(telemetry.packet_count, 1)
         self.assertEqual(telemetry.received_count, 1)
         self.assertEqual(telemetry.lost_count, 0)
+        self.assertEqual(telemetry.sent_packet_count, 1)
+        self.assertEqual(telemetry.sent_bytes, 1000)
+        self.assertEqual(telemetry.acknowledged_bytes, 1000)
+        self.assertEqual(telemetry.lost_bytes, 0)
+        self.assertEqual(telemetry.last_feedback_base_sequence_number, sequence_number)
+        self.assertEqual(telemetry.last_feedback_packet_count, 1)
         self.assertGreater(telemetry.last_target_bitrate_bps, 0)
 
 
