@@ -192,7 +192,7 @@ class AsyncRtpPacerTest(TestCase):
         provider.on_packet_sent(
             TransportControlSentPacket(
                 transport_sequence_number=sequence_number,
-                send_time_ms=10,
+                send_time_us=10_000,
                 size_bytes=1000,
                 ssrc=1234,
                 rtp_sequence_number=99,

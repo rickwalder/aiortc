@@ -58,6 +58,7 @@ class TelemetrySnapshot:
     sent_bytes: int
     acknowledged_bytes: int
     lost_bytes: int
+    prior_unacked_bytes: int
     encoded_payload_bytes_by_ssrc: dict[int, int]
 
 
@@ -141,7 +142,7 @@ class TransportCongestionController:
         self,
         *,
         transport_sequence_number: int,
-        send_time_ms: int,
+        send_time_us: int,
         size_bytes: int,
         payload_size_bytes: int = 0,
         ssrc: int,
@@ -153,7 +154,7 @@ class TransportCongestionController:
         self.__transport_control.on_packet_sent(
             TransportControlSentPacket(
                 transport_sequence_number=transport_sequence_number,
-                send_time_ms=send_time_ms,
+                send_time_us=send_time_us,
                 size_bytes=size_bytes,
                 ssrc=ssrc,
                 rtp_sequence_number=rtp_sequence_number,
@@ -169,17 +170,17 @@ class TransportCongestionController:
         state.encoded_payload_bytes += payload_bytes
 
     def handle_transport_feedback(
-        self, packet: RtcpTransportLayerCcPacket, now_ms: int
+        self, packet: RtcpTransportLayerCcPacket, now_us: int
     ) -> None:
         previous_target = self.__transport_control.get_target_bitrate()
         update = self.__transport_control.handle_transport_feedback(
-            packet.feedback, now_ms * 1000
+            packet.feedback, now_us
         )
         if update is not None:
             self.__recompute_allocation()
             self.__log_target_update(previous_target, update)
         self.__log_delay_usage_transition()
-        self.__log_telemetry(now_ms)
+        self.__log_telemetry(now_us // 1000)
 
     def get_pacer_config(self):
         return self.__transport_control.get_pacer_config()
@@ -477,6 +478,7 @@ class TransportCongestionController:
             sent_rate_bps = 0
             acked_rate_bps = 0
             lost_rate_bps = 0
+            prior_unacked_rate_bps = 0
             encoded_rate_bps_by_ssrc = {state.sender._ssrc: 0 for state in states}
         else:
             elapsed_ms = now_ms - self.__last_telemetry_snapshot.now_ms
@@ -496,6 +498,14 @@ class TransportCongestionController:
             )
             lost_rate_bps = int(
                 (telemetry.lost_bytes - self.__last_telemetry_snapshot.lost_bytes)
+                * 8
+                / elapsed_s
+            )
+            prior_unacked_rate_bps = int(
+                (
+                    telemetry.prior_unacked_bytes
+                    - self.__last_telemetry_snapshot.prior_unacked_bytes
+                )
                 * 8
                 / elapsed_s
             )
@@ -520,6 +530,7 @@ class TransportCongestionController:
             sent_bytes=telemetry.sent_bytes,
             acknowledged_bytes=telemetry.acknowledged_bytes,
             lost_bytes=telemetry.lost_bytes,
+            prior_unacked_bytes=telemetry.prior_unacked_bytes,
             encoded_payload_bytes_by_ssrc={
                 state.sender._ssrc: state.encoded_payload_bytes for state in states
             },
@@ -550,7 +561,7 @@ class TransportCongestionController:
             "target_bps=%d pacer_bps=%d "
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
             "encoded_observed_bps=%d sent_bps=%d acked_bps=%d lost_bps=%d "
-            "sent_fill=%.2f acked_fill=%.2f "
+            "prior_unacked_bps=%d sent_fill=%.2f acked_fill=%.2f "
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
             "acked_estimate_bps=%d in_alr=%s alr_budget=%.2f "
@@ -579,6 +590,7 @@ class TransportCongestionController:
             sent_rate_bps,
             acked_rate_bps,
             lost_rate_bps,
+            prior_unacked_rate_bps,
             sent_fill_ratio,
             acked_fill_ratio,
             telemetry.data_in_flight_bytes,

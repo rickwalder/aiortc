@@ -1,4 +1,5 @@
 import datetime
+import time
 
 NTP_EPOCH = datetime.datetime(1900, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -10,6 +11,10 @@ def current_datetime() -> datetime.datetime:
 def current_ms() -> int:
     delta = current_datetime() - NTP_EPOCH
     return int(delta.total_seconds() * 1000)
+
+
+def current_monotonic_us() -> int:
+    return time.monotonic_ns() // 1000
 
 
 def current_ntp_time() -> int:

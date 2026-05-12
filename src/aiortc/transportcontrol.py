@@ -36,7 +36,7 @@ class TransportControlCapabilities:
 @dataclass(frozen=True)
 class TransportControlSentPacket:
     transport_sequence_number: int
-    send_time_ms: int
+    send_time_us: int
     size_bytes: int
     ssrc: int
     rtp_sequence_number: int
@@ -56,6 +56,7 @@ class TransportControlTelemetry:
     sent_bytes: int = 0
     acknowledged_bytes: int = 0
     lost_bytes: int = 0
+    prior_unacked_bytes: int = 0
     data_in_flight_bytes: int = 0
     oldest_in_flight_age_ms: int = 0
     packet_history_size: int = 0
@@ -129,6 +130,7 @@ class PyccTransportControlProvider:
         self._sent_bytes = 0
         self._acknowledged_bytes = 0
         self._lost_bytes = 0
+        self._prior_unacked_bytes = 0
         self._last_feedback_time_us = 0
         self._last_feedback_base_sequence_number = 0
         self._last_feedback_packet_count = 0
@@ -158,7 +160,7 @@ class PyccTransportControlProvider:
         self._gcc.on_packet_sent(
             SentPacket(
                 transport_sequence_number=packet.transport_sequence_number,
-                send_time_us=packet.send_time_ms * 1000,
+                send_time_us=packet.send_time_us,
                 size_bytes=packet.size_bytes,
                 ssrc=packet.ssrc,
                 rtp_sequence_number=packet.rtp_sequence_number,
@@ -208,6 +210,9 @@ class PyccTransportControlProvider:
         self._lost_count += len(lost)
         self._acknowledged_bytes += sum(
             result.sent_packet.size_bytes for result in received
+        )
+        self._prior_unacked_bytes += sum(
+            result.sent_packet.prior_unacked_data_bytes for result in received
         )
         self._lost_bytes += sum(result.sent_packet.size_bytes for result in lost)
         self._first_time_lost_count += sum(
@@ -263,6 +268,7 @@ class PyccTransportControlProvider:
             sent_bytes=self._sent_bytes,
             acknowledged_bytes=self._acknowledged_bytes,
             lost_bytes=self._lost_bytes,
+            prior_unacked_bytes=self._prior_unacked_bytes,
             data_in_flight_bytes=packet_history.data_in_flight_bytes,
             oldest_in_flight_age_ms=oldest_in_flight_age_ms,
             packet_history_size=packet_history.history_size,
@@ -328,7 +334,11 @@ class AsyncRtpPacer:
         async with self._lock:
             pacing_info = self._pacing_info_for_packet(config)
             use_current_clock = now_ms is None
-            now_us = (clock.current_ms() if use_current_clock else now_ms) * 1000
+            now_us = (
+                clock.current_monotonic_us()
+                if use_current_clock
+                else now_ms * 1000
+            )
             if self._model is None:
                 self._model = LeakyBucketPacerModel(config, now_us)
             else:
@@ -338,7 +348,7 @@ class AsyncRtpPacer:
             if wait_us > 0:
                 await asyncio.sleep(wait_us / 1_000_000)
                 if use_current_clock:
-                    now_us = clock.current_ms() * 1000
+                    now_us = clock.current_monotonic_us()
                 else:
                     now_us += wait_us
 

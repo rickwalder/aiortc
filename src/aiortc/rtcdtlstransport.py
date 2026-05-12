@@ -620,7 +620,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         for packet in packets:
             if isinstance(packet, rtp.RtcpTransportLayerCcPacket):
                 self._congestion_controller.handle_transport_feedback(
-                    packet, clock.current_ms()
+                    packet, clock.current_monotonic_us()
                 )
             if isinstance(packet, RtcpPsfbPacket) and packet.fmt == rtp.RTCP_PSFB_APP:
                 try:
@@ -694,7 +694,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 await self._data_receiver._handle_data(data)
         elif first_byte > 127 and first_byte < 192 and self._rx_srtp:
             # SRTP / SRTCP
-            arrival_time_ms = clock.current_ms()
+            arrival_time_ms = clock.current_monotonic_us() // 1000
             try:
                 if is_rtcp(data):
                     data = self._rx_srtp.unprotect_rtcp(data)
@@ -787,7 +787,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             if transport_sequence_number is not None:
                 self._congestion_controller.on_packet_sent(
                     transport_sequence_number=transport_sequence_number,
-                    send_time_ms=clock.current_ms(),
+                    send_time_us=clock.current_monotonic_us(),
                     size_bytes=len(packet_bytes),
                     payload_size_bytes=payload_size_bytes,
                     ssrc=packet.ssrc,
