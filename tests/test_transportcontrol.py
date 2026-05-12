@@ -13,7 +13,7 @@ from aiortc.transportcontrol import (
     get_transport_control_capabilities,
 )
 from pycc import RTPFB_TRANSPORT_CC_FMT, TRANSPORT_CC_URI
-from pycc.types import PacerConfig
+from pycc.types import PacerConfig, ProbeClusterConfig
 
 from .utils import asynctest
 
@@ -162,6 +162,29 @@ class AsyncRtpPacerTest(TestCase):
             await pace_packet("second")
 
         self.assertEqual(order[-2:], [("sleep", order[-2][1]), ("sent", "second")])
+
+    @asynctest
+    async def test_pace_returns_probe_packet_info_until_cluster_minimum(self) -> None:
+        pacer = AsyncRtpPacer()
+        config = PacerConfig(
+            send_bitrate_bps=300_000,
+            window_us=40_000,
+            probe_cluster=ProbeClusterConfig(
+                id=9,
+                target_bitrate_bps=6_000_000,
+                target_duration_us=2_000,
+                target_probe_count=2,
+            ),
+        )
+
+        first = await pacer.pace(size_bytes=1500, config=config, now_ms=0)
+        second = await pacer.pace(size_bytes=1500, config=config, now_ms=0)
+        third = await pacer.pace(size_bytes=1500, config=config, now_ms=0)
+
+        self.assertTrue(first.is_probe)
+        self.assertEqual(first.probe_cluster_id, 9)
+        self.assertTrue(second.is_probe)
+        self.assertFalse(third.is_probe)
 
     def test_handle_feedback_activates_provider(self) -> None:
         provider = PyccTransportControlProvider()

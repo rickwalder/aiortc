@@ -16,6 +16,7 @@ from .rtp import (
 )
 from .transportcontrol import (
     AsyncRtpPacer,
+    PacedPacketInfo,
     PyccTransportControlProvider,
     TransportControlSentPacket,
 )
@@ -146,6 +147,7 @@ class TransportCongestionController:
         ssrc: int,
         rtp_sequence_number: int,
         is_retransmission: bool = False,
+        pacing_info: Optional[PacedPacketInfo] = None,
     ) -> None:
         self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
         self.__transport_control.on_packet_sent(
@@ -156,6 +158,7 @@ class TransportCongestionController:
                 ssrc=ssrc,
                 rtp_sequence_number=rtp_sequence_number,
                 is_retransmission=is_retransmission,
+                pacing_info=pacing_info,
             )
         )
 
@@ -183,8 +186,8 @@ class TransportCongestionController:
 
     async def pace_rtp_packet(
         self, *, size_bytes: int, now_ms: Optional[int] = None
-    ) -> None:
-        await self.__rtp_pacer.pace(
+    ) -> PacedPacketInfo:
+        return await self.__rtp_pacer.pace(
             size_bytes=size_bytes,
             config=self.__transport_control.get_pacer_config(),
             now_ms=now_ms,
@@ -326,6 +329,9 @@ class TransportCongestionController:
                 "transport-cc target update target_bps=%d stable_bps=%d "
                 "previous_bps=%s reason=%s delay_usage=%s aimd=%s acked_bps=%d "
                 "in_alr=%s alr_budget=%.2f link_capacity_bps=%d "
+                "pre_pushback_bps=%d pushback_bps=%d cwnd=%d cwnd_fill=%.2f "
+                "pushback_ratio=%.2f probe_id=%d probe_bps=%d "
+                "probe_estimate_bps=%d "
                 "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
                 "trend_ms=%.3f threshold_ms=%.3f send_delta_ms=%.3f "
                 "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
@@ -339,7 +345,16 @@ class TransportCongestionController:
                 telemetry.in_alr,
                 telemetry.alr_budget_ratio,
                 telemetry.link_capacity_bps,
+                telemetry.pre_pushback_target_bitrate_bps,
+                telemetry.pushback_target_bitrate_bps,
+                telemetry.congestion_window_bytes,
+                telemetry.congestion_window_fill_ratio,
+                telemetry.pushback_encoding_rate_ratio,
+                telemetry.probe_cluster_id,
+                telemetry.probe_target_bitrate_bps,
+                telemetry.last_probe_bitrate_bps,
                 update.loss_fraction,
+                telemetry.loss_sample,
                 update.rtt_us / 1000,
                 telemetry.trend_ms,
                 telemetry.trend_threshold_ms,
@@ -365,6 +380,9 @@ class TransportCongestionController:
             "transport-cc target update target_bps=%d stable_bps=%d previous_bps=%s "
             "reason=%s delay_usage=%s aimd=%s acked_bps=%d "
             "in_alr=%s alr_budget=%.2f link_capacity_bps=%d "
+            "pre_pushback_bps=%d pushback_bps=%d cwnd=%d cwnd_fill=%.2f "
+            "pushback_ratio=%.2f probe_id=%d probe_bps=%d "
+            "probe_estimate_bps=%d "
             "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
             "overuse_time_ms=%.3f send_delta_ms=%.3f recv_delta_ms=%.3f "
@@ -379,6 +397,14 @@ class TransportCongestionController:
             telemetry.in_alr,
             telemetry.alr_budget_ratio,
             telemetry.link_capacity_bps,
+            telemetry.pre_pushback_target_bitrate_bps,
+            telemetry.pushback_target_bitrate_bps,
+            telemetry.congestion_window_bytes,
+            telemetry.congestion_window_fill_ratio,
+            telemetry.pushback_encoding_rate_ratio,
+            telemetry.probe_cluster_id,
+            telemetry.probe_target_bitrate_bps,
+            telemetry.last_probe_bitrate_bps,
             update.loss_fraction,
             telemetry.loss_sample,
             update.rtt_us / 1000,
@@ -528,6 +554,9 @@ class TransportCongestionController:
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
             "acked_estimate_bps=%d in_alr=%s alr_budget=%.2f "
+            "pre_pushback_bps=%d pushback_bps=%d cwnd=%d cwnd_fill=%.2f "
+            "pushback_ratio=%.2f probe_id=%d probe_bps=%d "
+            "probe_estimate_bps=%d "
             "link_capacity_bps=%d link_lower_bps=%d link_upper_bps=%d "
             "loss_sample=%.3f loss_avg=%.3f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
@@ -563,6 +592,14 @@ class TransportCongestionController:
             telemetry.acked_bitrate_bps,
             telemetry.in_alr,
             telemetry.alr_budget_ratio,
+            telemetry.pre_pushback_target_bitrate_bps,
+            telemetry.pushback_target_bitrate_bps,
+            telemetry.congestion_window_bytes,
+            telemetry.congestion_window_fill_ratio,
+            telemetry.pushback_encoding_rate_ratio,
+            telemetry.probe_cluster_id,
+            telemetry.probe_target_bitrate_bps,
+            telemetry.last_probe_bitrate_bps,
             telemetry.link_capacity_bps,
             telemetry.link_capacity_lower_bps,
             telemetry.link_capacity_upper_bps,

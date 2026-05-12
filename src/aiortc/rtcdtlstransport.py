@@ -770,9 +770,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
+            pacing_info = None
 
             if is_video:
-                await self._congestion_controller.pace_rtp_packet(
+                pacing_info = await self._congestion_controller.pace_rtp_packet(
                     size_bytes=len(packet_bytes),
                 )
                 packet.extensions.abs_send_time = (
@@ -792,6 +793,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                     ssrc=packet.ssrc,
                     rtp_sequence_number=packet.sequence_number,
                     is_retransmission=is_retransmission,
+                    pacing_info=pacing_info,
                 )
 
     def _set_role(self, role: str) -> None:

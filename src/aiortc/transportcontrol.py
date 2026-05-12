@@ -9,6 +9,7 @@ from pycc import (
     TRANSPORT_CC_URI,
     GoogCcController,
     LeakyBucketPacerModel,
+    PacedPacketInfo,
     PacerConfig,
     RateConstraints,
     SentPacket,
@@ -40,6 +41,7 @@ class TransportControlSentPacket:
     ssrc: int
     rtp_sequence_number: int
     is_retransmission: bool = False
+    pacing_info: PacedPacketInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,14 @@ class TransportControlTelemetry:
     last_send_delta_ms: float = 0.0
     last_receive_delta_ms: float = 0.0
     last_delay_delta_ms: float = 0.0
+    pre_pushback_target_bitrate_bps: int = 0
+    pushback_target_bitrate_bps: int = 0
+    congestion_window_bytes: int = 0
+    congestion_window_fill_ratio: float = 0.0
+    pushback_encoding_rate_ratio: float = 1.0
+    probe_cluster_id: int = -1
+    probe_target_bitrate_bps: int = 0
+    last_probe_bitrate_bps: int = 0
 
 
 def get_transport_control_capabilities(kind: str) -> TransportControlCapabilities:
@@ -153,6 +163,11 @@ class PyccTransportControlProvider:
                 ssrc=packet.ssrc,
                 rtp_sequence_number=packet.rtp_sequence_number,
                 is_retransmission=packet.is_retransmission,
+                pacing_info=(
+                    packet.pacing_info
+                    if isinstance(packet.pacing_info, PacedPacketInfo)
+                    else PacedPacketInfo()
+                ),
             )
         )
 
@@ -278,6 +293,16 @@ class PyccTransportControlProvider:
             last_send_delta_ms=diagnostics.last_send_delta_us / 1000,
             last_receive_delta_ms=diagnostics.last_receive_delta_us / 1000,
             last_delay_delta_ms=diagnostics.last_delay_delta_ms,
+            pre_pushback_target_bitrate_bps=(
+                diagnostics.pre_pushback_target_bitrate_bps
+            ),
+            pushback_target_bitrate_bps=diagnostics.pushback_target_bitrate_bps,
+            congestion_window_bytes=diagnostics.congestion_window_bytes,
+            congestion_window_fill_ratio=diagnostics.congestion_window_fill_ratio,
+            pushback_encoding_rate_ratio=diagnostics.pushback_encoding_rate_ratio,
+            probe_cluster_id=diagnostics.probe_cluster_id,
+            probe_target_bitrate_bps=diagnostics.probe_target_bitrate_bps,
+            last_probe_bitrate_bps=diagnostics.last_probe_bitrate_bps or 0,
         )
 
 
@@ -285,6 +310,10 @@ class AsyncRtpPacer:
     def __init__(self) -> None:
         self._model: LeakyBucketPacerModel | None = None
         self._lock = asyncio.Lock()
+        self._active_probe_cluster_id: int | None = None
+        self._completed_probe_cluster_ids: set[int] = set()
+        self._probe_sent_bytes = 0
+        self._probe_sent_packets = 0
 
     async def pace(
         self,
@@ -292,11 +321,12 @@ class AsyncRtpPacer:
         size_bytes: int,
         config: PacerConfig,
         now_ms: int | None = None,
-    ) -> None:
+    ) -> PacedPacketInfo:
         if size_bytes <= 0 or config.send_bitrate_bps <= 0:
-            return
+            return PacedPacketInfo()
 
         async with self._lock:
+            pacing_info = self._pacing_info_for_packet(config)
             use_current_clock = now_ms is None
             now_us = (clock.current_ms() if use_current_clock else now_ms) * 1000
             if self._model is None:
@@ -313,6 +343,17 @@ class AsyncRtpPacer:
                     now_us += wait_us
 
             self._model.on_packet_sent(size_bytes, now_us)
+            if pacing_info.is_probe:
+                self._probe_sent_packets += 1
+                self._probe_sent_bytes += size_bytes
+                if (
+                    self._probe_sent_packets >= pacing_info.probe_cluster_min_probes
+                    and self._probe_sent_bytes >= pacing_info.probe_cluster_min_bytes
+                ):
+                    self._completed_probe_cluster_ids.add(
+                        pacing_info.probe_cluster_id
+                    )
+            return pacing_info
 
     def _wait_time_us(self, size_bytes: int, now_us: int) -> int:
         assert self._model is not None
@@ -321,9 +362,23 @@ class AsyncRtpPacer:
             return 0
 
         deficit_bytes = size_bytes - self._model.budget_bytes
-        if self._model.config.send_bitrate_bps <= 0:
+        if self._model.config.effective_send_bitrate_bps <= 0:
             return 0
         return max(
             0,
-            int(deficit_bytes * 8_000_000 / self._model.config.send_bitrate_bps),
+            int(
+                deficit_bytes
+                * 8_000_000
+                / self._model.config.effective_send_bitrate_bps
+            ),
         )
+
+    def _pacing_info_for_packet(self, config: PacerConfig) -> PacedPacketInfo:
+        probe = config.probe_cluster
+        if probe is None or probe.id in self._completed_probe_cluster_ids:
+            return PacedPacketInfo()
+        if self._active_probe_cluster_id != probe.id:
+            self._active_probe_cluster_id = probe.id
+            self._probe_sent_bytes = 0
+            self._probe_sent_packets = 0
+        return probe.pacing_info
