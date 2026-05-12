@@ -322,7 +322,7 @@ class RTCRtpSenderTest(TestCase):
             local_transport._send_rtp = mock_send_rtp  # type: ignore
 
             with patch(
-                "aiortc.rtcrtpsender.AsyncRtpPacer.pace",
+                "aiortc.congestion.AsyncRtpPacer.pace",
                 new_callable=AsyncMock,
             ) as mock_pace:
                 sender = RTCRtpSender(VideoStreamTrack(), local_transport)

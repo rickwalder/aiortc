@@ -1,5 +1,5 @@
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiortc.codecs import CODECS, HEADER_EXTENSIONS, is_rtx
 from aiortc.congestion import TransportCongestionController
@@ -227,6 +227,19 @@ class TransportCongestionControllerTest(TestCase):
 
         self.assertGreater(config.send_bitrate_bps, 0)
         self.assertGreater(config.data_window_bytes, 0)
+
+    @asynctest
+    async def test_pace_rtp_packet_uses_transport_controller_pacer(self) -> None:
+        controller = TransportCongestionController()
+
+        with patch(
+            "aiortc.congestion.AsyncRtpPacer.pace",
+            new_callable=AsyncMock,
+        ) as mock_pace:
+            await controller.pace_rtp_packet(size_bytes=1200, now_ms=100)
+            await controller.pace_rtp_packet(size_bytes=1200, now_ms=100)
+
+        self.assertEqual(mock_pace.await_count, 2)
 
     def test_initial_allocation_splits_pycc_transport_target_evenly(self) -> None:
         controller = TransportCongestionController()

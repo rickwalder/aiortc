@@ -15,6 +15,7 @@ from .rtp import (
     pack_remb_fci,
 )
 from .transportcontrol import (
+    AsyncRtpPacer,
     PyccTransportControlProvider,
     TransportControlSentPacket,
 )
@@ -75,6 +76,7 @@ class TransportCongestionController:
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
         self.__transport_control = PyccTransportControlProvider()
+        self.__rtp_pacer = AsyncRtpPacer()
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
@@ -168,6 +170,13 @@ class TransportCongestionController:
 
     def get_pacer_config(self):
         return self.__transport_control.get_pacer_config()
+
+    async def pace_rtp_packet(self, *, size_bytes: int, now_ms: int) -> None:
+        await self.__rtp_pacer.pace(
+            size_bytes=size_bytes,
+            config=self.__transport_control.get_pacer_config(),
+            now_ms=now_ms,
+        )
 
     def observe_incoming_rtp(
         self,

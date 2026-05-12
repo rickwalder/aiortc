@@ -45,7 +45,6 @@ from .stats import (
     RTCRemoteInboundRtpStreamStats,
     RTCStatsReport,
 )
-from .transportcontrol import AsyncRtpPacer
 from .utils import random16, random32, uint16_add, uint32_add
 
 logger = logging.getLogger(__name__)
@@ -111,7 +110,6 @@ class RTCRtpSender:
         self.__mid: Optional[str] = None
         self.__rtp_exited = asyncio.Event()
         self.__rtp_header_extensions_map = rtp.HeaderExtensionsMap()
-        self.__rtp_pacer = AsyncRtpPacer()
         self.__rtp_started = asyncio.Event()
         self.__rtp_task: Optional[asyncio.Future[None]] = None
         self.__rtp_history: dict[int, RtpPacket] = {}
@@ -438,9 +436,8 @@ class RTCRtpSender:
                     )
                     packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
                     if self.__kind == "video":
-                        await self.__rtp_pacer.pace(
+                        await self.__transport._congestion_controller.pace_rtp_packet(
                             size_bytes=len(packet_bytes),
-                            config=self.__transport._congestion_controller.get_pacer_config(),
                             now_ms=clock.current_ms(),
                         )
 
