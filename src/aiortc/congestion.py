@@ -48,6 +48,7 @@ class SenderState:
     weight: float
     allocated_bitrate: int
     applied_bitrate: Optional[int] = None
+    encoded_payload_bytes: int = 0
 
 
 @dataclass
@@ -56,6 +57,7 @@ class TelemetrySnapshot:
     sent_bytes: int
     acknowledged_bytes: int
     lost_bytes: int
+    encoded_payload_bytes_by_ssrc: dict[int, int]
 
 
 class TransportCongestionController:
@@ -154,6 +156,12 @@ class TransportCongestionController:
                 is_retransmission=is_retransmission,
             )
         )
+
+    def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
+        state = self.__senders.get(ssrc)
+        if state is None or payload_bytes <= 0:
+            return
+        state.encoded_payload_bytes += payload_bytes
 
     def handle_transport_feedback(
         self, packet: RtcpTransportLayerCcPacket, now_ms: int
@@ -441,6 +449,7 @@ class TransportCongestionController:
             sent_rate_bps = 0
             acked_rate_bps = 0
             lost_rate_bps = 0
+            encoded_rate_bps_by_ssrc = {state.sender._ssrc: 0 for state in states}
         else:
             elapsed_ms = now_ms - self.__last_telemetry_snapshot.now_ms
             elapsed_s = max(0.001, elapsed_ms / 1000)
@@ -462,6 +471,19 @@ class TransportCongestionController:
                 * 8
                 / elapsed_s
             )
+            encoded_rate_bps_by_ssrc = {}
+            for state in states:
+                ssrc = state.sender._ssrc
+                previous_encoded_bytes = (
+                    self.__last_telemetry_snapshot.encoded_payload_bytes_by_ssrc.get(
+                        ssrc, 0
+                    )
+                )
+                encoded_rate_bps_by_ssrc[ssrc] = int(
+                    (state.encoded_payload_bytes - previous_encoded_bytes)
+                    * 8
+                    / elapsed_s
+                )
         target_bitrate = max(1, telemetry.last_target_bitrate_bps)
         sent_fill_ratio = sent_rate_bps / target_bitrate
         acked_fill_ratio = acked_rate_bps / target_bitrate
@@ -470,17 +492,22 @@ class TransportCongestionController:
             sent_bytes=telemetry.sent_bytes,
             acknowledged_bytes=telemetry.acknowledged_bytes,
             lost_bytes=telemetry.lost_bytes,
+            encoded_payload_bytes_by_ssrc={
+                state.sender._ssrc: state.encoded_payload_bytes for state in states
+            },
         )
 
+        encoded_observed_bps = sum(encoded_rate_bps_by_ssrc.values())
         sender_states = []
         for state in states:
             sender_states.append(
-                "%d:alloc=%d applied=%s encoder=%s"
+                "%d:alloc=%d applied=%s encoder=%s observed=%d"
                 % (
                     state.sender._ssrc,
                     state.allocated_bitrate,
                     state.applied_bitrate,
                     state.sender._get_target_bitrate(),
+                    encoded_rate_bps_by_ssrc.get(state.sender._ssrc, 0),
                 )
             )
 
@@ -494,7 +521,7 @@ class TransportCongestionController:
             "lost=%d first_lost=%d recovered=%d loss=%.3f "
             "target_bps=%d pacer_bps=%d "
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
-            "sent_bps=%d acked_bps=%d lost_bps=%d "
+            "encoded_observed_bps=%d sent_bps=%d acked_bps=%d lost_bps=%d "
             "sent_fill=%.2f acked_fill=%.2f "
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
@@ -517,6 +544,7 @@ class TransportCongestionController:
             allocated_total,
             applied_total,
             encoder_total,
+            encoded_observed_bps,
             sent_rate_bps,
             acked_rate_bps,
             lost_rate_bps,

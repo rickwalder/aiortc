@@ -403,6 +403,14 @@ class RTCRtpSender:
                 if enc_frame is None:
                     continue
 
+                if self.__kind == "video":
+                    self.__transport._congestion_controller.observe_encoded_frame(
+                        ssrc=self._ssrc,
+                        payload_bytes=sum(
+                            len(payload) for payload in enc_frame.payloads
+                        ),
+                    )
+
                 timestamp = uint32_add(timestamp_origin, enc_frame.timestamp)
 
                 for i, payload in enumerate(enc_frame.payloads):
@@ -447,19 +455,19 @@ class RTCRtpSender:
                             self.__rtp_header_extensions_map
                         )
 
-                    send_time_ms = clock.current_ms()
                     transport_sequence_number = (
                         packet.extensions.transport_sequence_number
                     )
+                    await self.transport._send_rtp(packet_bytes)
+
                     if transport_sequence_number is not None:
                         self.__transport._congestion_controller.on_packet_sent(
                             transport_sequence_number=transport_sequence_number,
-                            send_time_ms=send_time_ms,
+                            send_time_ms=clock.current_ms(),
                             size_bytes=len(packet_bytes),
                             ssrc=packet.ssrc,
                             rtp_sequence_number=packet.sequence_number,
                         )
-                    await self.transport._send_rtp(packet_bytes)
 
                     self.__ntp_timestamp = clock.current_ntp_time()
                     self.__rtp_timestamp = packet.timestamp
