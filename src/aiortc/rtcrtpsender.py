@@ -438,7 +438,6 @@ class RTCRtpSender:
                     if self.__kind == "video":
                         await self.__transport._congestion_controller.pace_rtp_packet(
                             size_bytes=len(packet_bytes),
-                            now_ms=clock.current_ms(),
                         )
 
                         packet.extensions.abs_send_time = (

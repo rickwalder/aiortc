@@ -18,6 +18,7 @@ from pycc import (
     uint16_add,
 )
 
+from . import clock
 from .rtcrtpparameters import RTCRtcpFeedback, RTCRtpHeaderExtensionParameters
 
 RTCP_RTPFB = 205
@@ -275,12 +276,19 @@ class AsyncRtpPacer:
         self._model: LeakyBucketPacerModel | None = None
         self._lock = asyncio.Lock()
 
-    async def pace(self, *, size_bytes: int, config: PacerConfig, now_ms: int) -> None:
+    async def pace(
+        self,
+        *,
+        size_bytes: int,
+        config: PacerConfig,
+        now_ms: int | None = None,
+    ) -> None:
         if size_bytes <= 0 or config.send_bitrate_bps <= 0:
             return
 
         async with self._lock:
-            now_us = now_ms * 1000
+            use_current_clock = now_ms is None
+            now_us = (clock.current_ms() if use_current_clock else now_ms) * 1000
             if self._model is None:
                 self._model = LeakyBucketPacerModel(config, now_us)
             else:
@@ -289,7 +297,10 @@ class AsyncRtpPacer:
             wait_us = self._wait_time_us(size_bytes, now_us)
             if wait_us > 0:
                 await asyncio.sleep(wait_us / 1_000_000)
-                now_us += wait_us
+                if use_current_clock:
+                    now_us = clock.current_ms() * 1000
+                else:
+                    now_us += wait_us
 
             self._model.on_packet_sent(size_bytes, now_us)
 
