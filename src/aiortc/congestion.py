@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 from dataclasses import dataclass
 from typing import Optional, Protocol
-
-from pycc import RateConstraints
 
 from .rate import RemoteBitrateEstimator
 from .rtp import (
@@ -27,9 +24,6 @@ _TELEMETRY_INTERVAL_MS = int(
     os.environ.get("AIORTC_TRANSPORT_CC_TELEMETRY_INTERVAL_MS", "10000")
 )
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
-_TRANSPORT_MIN_BITRATE = 1_500_000
-_TRANSPORT_START_BITRATE = 1_500_000
-_TRANSPORT_MAX_BITRATE = 9_000_000
 
 
 class CongestionControlledSender(Protocol):
@@ -37,8 +31,6 @@ class CongestionControlledSender(Protocol):
     kind: str
 
     def _get_target_bitrate(self) -> Optional[int]: ...
-
-    def _get_bitrate_bounds(self) -> tuple[int, int]: ...
 
     def _set_target_bitrate(self, bitrate: int) -> None: ...
 
@@ -52,8 +44,6 @@ class CongestionControlledReceiver(Protocol):
 @dataclass
 class SenderState:
     sender: CongestionControlledSender
-    min_bitrate: int
-    max_bitrate: int
     weight: float
     allocated_bitrate: int
     applied_bitrate: Optional[int] = None
@@ -84,13 +74,7 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
-        self.__transport_control = PyccTransportControlProvider(
-            RateConstraints(
-                min_bitrate_bps=_TRANSPORT_MIN_BITRATE,
-                start_bitrate_bps=_TRANSPORT_START_BITRATE,
-                max_bitrate_bps=_TRANSPORT_MAX_BITRATE,
-            )
-        )
+        self.__transport_control = PyccTransportControlProvider()
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
@@ -107,15 +91,10 @@ class TransportCongestionController:
         if sender.kind != "video":
             return
 
-        initial = sender._get_target_bitrate() or 1_000_000
-        min_bitrate, max_bitrate = sender._get_bitrate_bounds()
-        initial = max(min_bitrate, min(initial, max_bitrate))
         self.__senders[sender._ssrc] = SenderState(
             sender=sender,
-            min_bitrate=min_bitrate,
-            max_bitrate=max_bitrate,
             weight=1.0,
-            allocated_bitrate=initial,
+            allocated_bitrate=0,
             applied_bitrate=None,
         )
         self.__recompute_allocation()
@@ -177,12 +156,11 @@ class TransportCongestionController:
     def handle_transport_feedback(
         self, packet: RtcpTransportLayerCcPacket, now_ms: int
     ) -> None:
+        previous_target = self.__transport_control.get_target_bitrate()
         update = self.__transport_control.handle_transport_feedback(
             packet.feedback, now_ms * 1000
         )
         if update is not None:
-            previous_target = self.__session_target_bitrate
-            self.__session_target_bitrate = update.target_bitrate_bps
             self.__recompute_allocation()
             self.__log_target_update(previous_target, update)
         self.__log_delay_usage_transition()
@@ -277,97 +255,26 @@ class TransportCongestionController:
         if self.__session_target_bitrate is not None:
             return self.__session_target_bitrate
 
-        return sum(state.allocated_bitrate for state in self.__senders.values())
+        return self.__transport_control.get_target_bitrate()
+
+    def __current_session_target(self) -> int:
+        if (
+            not self.__transport_control.active
+            and self.__session_target_bitrate is not None
+        ):
+            return self.__session_target_bitrate
+        return self.__transport_control.get_target_bitrate()
 
     def __recompute_allocation(self) -> None:
         if not self.__senders:
             return
 
-        if self.__session_target_bitrate is None:
-            for state in self.__senders.values():
-                self.__apply_sender_target(state)
-            return
-
         states = list(self.__senders.values())
-        floor = sum(state.min_bitrate for state in states)
-        ceiling = sum(state.max_bitrate for state in states)
-        session = max(floor, min(self.__session_target_bitrate, ceiling))
-
-        for state in states:
-            state.allocated_bitrate = state.min_bitrate
-
-        remaining = session - floor
-        if remaining <= 0:
-            for state in states:
-                self.__apply_sender_target(state)
-            return
-
-        allocatable = {
-            state.sender._ssrc: state.max_bitrate - state.min_bitrate
-            for state in states
-        }
-        active_states = [
-            state for state in states if allocatable[state.sender._ssrc] > 0
-        ]
-
-        while remaining > 0 and active_states:
-            weight_total = sum(state.weight for state in active_states)
-            if weight_total <= 0:
-                break
-
-            round_remaining = remaining
-            grants: dict[int, int] = {}
-            remainders: list[tuple[float, SenderState]] = []
-            distributed = 0
-
-            for state in active_states:
-                room = allocatable[state.sender._ssrc]
-                ideal = round_remaining * (state.weight / weight_total)
-                grant = min(room, math.floor(ideal))
-                grants[state.sender._ssrc] = grant
-                distributed += grant
-                remainders.append((ideal - math.floor(ideal), state))
-
-            leftover = round_remaining - distributed
-            if leftover > 0:
-                for _, state in sorted(
-                    remainders, key=lambda item: item[0], reverse=True
-                ):
-                    room = allocatable[state.sender._ssrc]
-                    grant = grants[state.sender._ssrc]
-                    if room <= grant:
-                        continue
-                    grants[state.sender._ssrc] += 1
-                    distributed += 1
-                    leftover -= 1
-                    if leftover <= 0:
-                        break
-
-            if distributed <= 0:
-                for state in active_states:
-                    room = allocatable[state.sender._ssrc]
-                    if room <= 0:
-                        continue
-                    grants[state.sender._ssrc] = grants.get(state.sender._ssrc, 0) + 1
-                    distributed += 1
-                    leftover -= 1
-                    if distributed >= remaining:
-                        break
-
-            if distributed <= 0:
-                break
-
-            for state in active_states:
-                grant = grants.get(state.sender._ssrc, 0)
-                if grant <= 0:
-                    continue
-                state.allocated_bitrate += grant
-                allocatable[state.sender._ssrc] -= grant
-
-            remaining -= distributed
-            active_states = [
-                state for state in active_states if allocatable[state.sender._ssrc] > 0
-            ]
+        session = self.__current_session_target()
+        base_allocation = session // len(states)
+        remainder = session % len(states)
+        for index, state in enumerate(states):
+            state.allocated_bitrate = base_allocation + (1 if index < remainder else 0)
 
         for state in states:
             self.__apply_sender_target(state)
@@ -499,18 +406,12 @@ class TransportCongestionController:
 
         pacer = self.__transport_control.get_pacer_config()
         states = list(self.__senders.values())
-        allocation_floor = sum(state.min_bitrate for state in states)
-        allocation_ceiling = sum(state.max_bitrate for state in states)
         allocated_total = sum(state.allocated_bitrate for state in states)
         applied_total = sum(
             state.applied_bitrate or 0 for state in states
         )
         encoder_total = sum(
             state.sender._get_target_bitrate() or 0 for state in states
-        )
-        floor_limited = (
-            self.__session_target_bitrate is not None
-            and self.__session_target_bitrate < allocation_floor
         )
 
         if self.__last_telemetry_snapshot is None:
@@ -566,9 +467,9 @@ class TransportCongestionController:
         logger.info(
             "transport-cc telemetry feedbacks=%d packets=%d received=%d "
             "lost=%d first_lost=%d recovered=%d loss=%.3f "
-            "target_bps=%d pacer_bps=%d floor_bps=%d ceiling_bps=%d "
+            "target_bps=%d pacer_bps=%d "
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
-            "floor_limited=%s sent_bps=%d acked_bps=%d lost_bps=%d "
+            "sent_bps=%d acked_bps=%d lost_bps=%d "
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
             "acked_estimate_bps=%d loss_sample=%.3f loss_avg=%.3f "
@@ -585,12 +486,9 @@ class TransportCongestionController:
             loss_fraction,
             telemetry.last_target_bitrate_bps,
             pacer.send_bitrate_bps,
-            allocation_floor,
-            allocation_ceiling,
             allocated_total,
             applied_total,
             encoder_total,
-            floor_limited,
             sent_rate_bps,
             acked_rate_bps,
             lost_rate_bps,

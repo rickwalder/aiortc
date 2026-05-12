@@ -25,6 +25,22 @@ class DummyReceiver:
         return 4321
 
 
+class DummySender:
+    kind = "video"
+
+    def __init__(self, ssrc: int, target_bitrate: int = 2_500_000) -> None:
+        self._ssrc = ssrc
+        self.target_bitrate = target_bitrate
+        self.applied_bitrates = []
+
+    def _get_target_bitrate(self) -> int:
+        return self.target_bitrate
+
+    def _set_target_bitrate(self, bitrate: int) -> None:
+        self.target_bitrate = bitrate
+        self.applied_bitrates.append(bitrate)
+
+
 class TransportControlCapabilitiesTest(TestCase):
     def test_audio_capabilities_are_empty(self) -> None:
         capabilities = get_transport_control_capabilities("audio")
@@ -94,6 +110,11 @@ class PyccTransportControlProviderTest(TestCase):
 
         self.assertGreater(config.send_bitrate_bps, 0)
         self.assertGreater(config.data_window_bytes, 0)
+
+    def test_get_target_bitrate_uses_pycc_defaults(self) -> None:
+        provider = PyccTransportControlProvider()
+
+        self.assertEqual(provider.get_target_bitrate(), 7_500_000)
 
 
 class AsyncRtpPacerTest(TestCase):
@@ -206,3 +227,15 @@ class TransportCongestionControllerTest(TestCase):
 
         self.assertGreater(config.send_bitrate_bps, 0)
         self.assertGreater(config.data_window_bytes, 0)
+
+    def test_initial_allocation_splits_pycc_transport_target_evenly(self) -> None:
+        controller = TransportCongestionController()
+        senders = [DummySender(1000 + i) for i in range(3)]
+
+        for sender in senders:
+            controller.register_sender(sender)
+
+        self.assertEqual(
+            [sender.target_bitrate for sender in senders],
+            [2_500_000] * 3,
+        )

@@ -210,6 +210,9 @@ class PyccTransportControlProvider:
     def get_pacer_config(self) -> PacerConfig:
         return self._gcc.get_pacer_config()
 
+    def get_target_bitrate(self) -> int:
+        return self._gcc.get_target_bitrate()
+
     def get_telemetry(self) -> TransportControlTelemetry:
         update = self._last_update
         packet_history = self._gcc.packet_history
