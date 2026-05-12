@@ -371,6 +371,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._role = "auto"
         self._rtp_header_extensions_map = rtp.HeaderExtensionsMap()
         self._rtp_router = RtpRouter()
+        self._rtp_send_lock = asyncio.Lock()
         self._congestion_controller = TransportCongestionController()
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
@@ -749,6 +750,49 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         await self.transport._send(data)
         self.__tx_bytes += len(data)
         self.__tx_packets += 1
+
+    async def _send_rtp_packet(
+        self,
+        packet: RtpPacket,
+        extensions_map: rtp.HeaderExtensionsMap,
+        *,
+        is_video: bool = False,
+        payload_size_bytes: int = 0,
+        is_retransmission: bool = False,
+    ) -> None:
+        async with self._rtp_send_lock:
+            if is_video and extensions_map.has_transport_sequence_number:
+                packet.extensions.transport_sequence_number = (
+                    self._congestion_controller.next_transport_sequence_number()
+                )
+
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            packet_bytes = packet.serialize(extensions_map)
+
+            if is_video:
+                await self._congestion_controller.pace_rtp_packet(
+                    size_bytes=len(packet_bytes),
+                )
+                packet.extensions.abs_send_time = (
+                    clock.current_ntp_time() >> 14
+                ) & 0x00FFFFFF
+                packet_bytes = packet.serialize(extensions_map)
+
+            await self._send_rtp(packet_bytes)
+
+            transport_sequence_number = packet.extensions.transport_sequence_number
+            if transport_sequence_number is not None:
+                self._congestion_controller.on_packet_sent(
+                    transport_sequence_number=transport_sequence_number,
+                    send_time_ms=clock.current_ms(),
+                    size_bytes=len(packet_bytes),
+                    payload_size_bytes=payload_size_bytes,
+                    ssrc=packet.ssrc,
+                    rtp_sequence_number=packet.sequence_number,
+                    is_retransmission=is_retransmission,
+                )
 
     def _set_role(self, role: str) -> None:
         self._role = role

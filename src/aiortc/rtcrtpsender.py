@@ -354,8 +354,12 @@ class RTCRtpSender:
                 self.__rtx_sequence_number = uint16_add(self.__rtx_sequence_number, 1)
 
             self.__log_debug("> %s", packet)
-            packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
-            await self.transport._send_rtp(packet_bytes)
+            await self.transport._send_rtp_packet(
+                packet,
+                self.__rtp_header_extensions_map,
+                is_video=self.__kind == "video",
+                is_retransmission=True,
+            )
 
     def _send_keyframe(self) -> None:
         """
@@ -416,16 +420,7 @@ class RTCRtpSender:
                     packet.marker = (i == len(enc_frame.payloads) - 1) and 1 or 0
 
                     # set header extensions
-                    packet.extensions.abs_send_time = (
-                        clock.current_ntp_time() >> 14
-                    ) & 0x00FFFFFF
                     packet.extensions.mid = self.__mid
-                    if (
-                        self.__rtp_header_extensions_map.has_transport_sequence_number
-                    ):
-                        packet.extensions.transport_sequence_number = (
-                            self.__transport._congestion_controller.next_transport_sequence_number()
-                        )
                     if enc_frame.audio_level is not None:
                         packet.extensions.audio_level = (False, -enc_frame.audio_level)
 
@@ -434,33 +429,12 @@ class RTCRtpSender:
                     self.__rtp_history[packet.sequence_number % RTP_HISTORY_SIZE] = (
                         packet
                     )
-                    packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
-                    if self.__kind == "video":
-                        await self.__transport._congestion_controller.pace_rtp_packet(
-                            size_bytes=len(packet_bytes),
-                        )
-
-                        packet.extensions.abs_send_time = (
-                            clock.current_ntp_time() >> 14
-                        ) & 0x00FFFFFF
-                        packet_bytes = packet.serialize(
-                            self.__rtp_header_extensions_map
-                        )
-
-                    transport_sequence_number = (
-                        packet.extensions.transport_sequence_number
+                    await self.transport._send_rtp_packet(
+                        packet,
+                        self.__rtp_header_extensions_map,
+                        is_video=self.__kind == "video",
+                        payload_size_bytes=len(payload),
                     )
-                    await self.transport._send_rtp(packet_bytes)
-
-                    if transport_sequence_number is not None:
-                        self.__transport._congestion_controller.on_packet_sent(
-                            transport_sequence_number=transport_sequence_number,
-                            send_time_ms=clock.current_ms(),
-                            size_bytes=len(packet_bytes),
-                            payload_size_bytes=len(payload),
-                            ssrc=packet.ssrc,
-                            rtp_sequence_number=packet.sequence_number,
-                        )
 
                     self.__ntp_timestamp = clock.current_ntp_time()
                     self.__rtp_timestamp = packet.timestamp

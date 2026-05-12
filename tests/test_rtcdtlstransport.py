@@ -15,13 +15,16 @@ from aiortc.rtcdtlstransport import (
 from aiortc.rtcrtpparameters import (
     RTCRtpCodecParameters,
     RTCRtpDecodingParameters,
+    RTCRtpHeaderExtensionParameters,
     RTCRtpReceiveParameters,
+    RTCRtpSendParameters,
 )
 from aiortc.rtp import (
     RTCP_PSFB_APP,
     RTCP_PSFB_PLI,
     RTCP_RTPFB_NACK,
     AnyRtcpPacket,
+    HeaderExtensionsMap,
     RtcpByePacket,
     RtcpPsfbPacket,
     RtcpReceiverInfo,
@@ -33,6 +36,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
+from pycc import TRANSPORT_CC_URI
 
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -254,6 +258,59 @@ class RTCDtlsTransportTest(TestCase):
         # try sending after close
         with self.assertRaises(ConnectionError):
             await session1._send_rtp(RTP)
+
+    @asynctest
+    async def test_send_rtp_packet_assigns_twcc_at_transport(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(
+            RTCRtpSendParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(
+                        id=5,
+                        uri=TRANSPORT_CC_URI,
+                    )
+                ]
+            )
+        )
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet1 = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet1.ssrc = 1234
+        packet1.payload = b"abc"
+        packet2 = RtpPacket(payload_type=100, sequence_number=1001, timestamp=1)
+        packet2.ssrc = 1234
+        packet2.payload = b"def"
+
+        self.assertIsNone(packet1.extensions.transport_sequence_number)
+        self.assertIsNone(packet2.extensions.transport_sequence_number)
+
+        await session._send_rtp_packet(
+            packet1,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet1.payload),
+        )
+        await session._send_rtp_packet(
+            packet2,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet2.payload),
+        )
+
+        self.assertEqual(
+            [packet.extensions.transport_sequence_number for packet in sent_packets],
+            [0, 1],
+        )
 
     @asynctest
     async def test_rtp_malformed(self) -> None:
