@@ -79,6 +79,10 @@ class TransportControlTelemetry:
     loss_sample: float = 0.0
     loss_average: float = 0.0
     trend_ms: float = 0.0
+    raw_trend: float = 0.0
+    accumulated_delay_ms: float = 0.0
+    smoothed_delay_ms: float = 0.0
+    trend_window_ms: float = 0.0
     trend_threshold_ms: float = 0.0
     overuse_counter: int = 0
     overuse_time_ms: float = 0.0
@@ -291,6 +295,10 @@ class PyccTransportControlProvider:
             loss_sample=diagnostics.loss_sample,
             loss_average=diagnostics.loss_average,
             trend_ms=diagnostics.trend_ms,
+            raw_trend=diagnostics.raw_trend,
+            accumulated_delay_ms=diagnostics.accumulated_delay_ms,
+            smoothed_delay_ms=diagnostics.smoothed_delay_ms,
+            trend_window_ms=diagnostics.trend_window_ms,
             trend_threshold_ms=diagnostics.trend_threshold_ms,
             overuse_counter=diagnostics.overuse_counter,
             overuse_time_ms=diagnostics.overuse_time_us / 1000,

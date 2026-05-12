@@ -334,8 +334,10 @@ class TransportCongestionController:
                 "pushback_ratio=%.2f probe_id=%d probe_bps=%d "
                 "probe_estimate_bps=%d "
                 "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
-                "trend_ms=%.3f threshold_ms=%.3f send_delta_ms=%.3f "
-                "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
+                "trend_ms=%.3f raw_trend=%.6f threshold_ms=%.3f "
+                "acc_delay_ms=%.3f smooth_delay_ms=%.3f trend_window_ms=%.3f "
+                "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
+                "group_bytes=%d",
                 update.target_bitrate_bps,
                 update.stable_target_bitrate_bps,
                 previous,
@@ -358,7 +360,11 @@ class TransportCongestionController:
                 telemetry.loss_sample,
                 update.rtt_us / 1000,
                 telemetry.trend_ms,
+                telemetry.raw_trend,
                 telemetry.trend_threshold_ms,
+                telemetry.accumulated_delay_ms,
+                telemetry.smoothed_delay_ms,
+                telemetry.trend_window_ms,
                 telemetry.last_send_delta_ms,
                 telemetry.last_receive_delta_ms,
                 telemetry.last_delay_delta_ms,
@@ -385,9 +391,10 @@ class TransportCongestionController:
             "pushback_ratio=%.2f probe_id=%d probe_bps=%d "
             "probe_estimate_bps=%d "
             "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
-            "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
-            "overuse_time_ms=%.3f send_delta_ms=%.3f recv_delta_ms=%.3f "
-            "delay_delta_ms=%.3f group_bytes=%d",
+            "trend_ms=%.3f raw_trend=%.6f threshold_ms=%.3f "
+            "acc_delay_ms=%.3f smooth_delay_ms=%.3f trend_window_ms=%.3f "
+            "overuse_count=%d overuse_time_ms=%.3f send_delta_ms=%.3f "
+            "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
             update.target_bitrate_bps,
             update.stable_target_bitrate_bps,
             previous,
@@ -410,7 +417,11 @@ class TransportCongestionController:
             telemetry.loss_sample,
             update.rtt_us / 1000,
             telemetry.trend_ms,
+            telemetry.raw_trend,
             telemetry.trend_threshold_ms,
+            telemetry.accumulated_delay_ms,
+            telemetry.smoothed_delay_ms,
+            telemetry.trend_window_ms,
             telemetry.overuse_counter,
             telemetry.overuse_time_ms,
             telemetry.last_send_delta_ms,
@@ -430,7 +441,9 @@ class TransportCongestionController:
         level = logging.INFO if usage != "normal" else logging.DEBUG
         logger.log(
             level,
-            "transport-cc delay state %s -> %s trend_ms=%.3f threshold_ms=%.3f "
+            "transport-cc delay state %s -> %s trend_ms=%.3f "
+            "raw_trend=%.6f threshold_ms=%.3f "
+            "acc_delay_ms=%.3f smooth_delay_ms=%.3f trend_window_ms=%.3f "
             "overuse_count=%d overuse_time_ms=%.3f acked_bps=%d "
             "in_alr=%s alr_budget=%.2f "
             "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
@@ -438,7 +451,11 @@ class TransportCongestionController:
             previous or "unknown",
             usage,
             telemetry.trend_ms,
+            telemetry.raw_trend,
             telemetry.trend_threshold_ms,
+            telemetry.accumulated_delay_ms,
+            telemetry.smoothed_delay_ms,
+            telemetry.trend_window_ms,
             telemetry.overuse_counter,
             telemetry.overuse_time_ms,
             telemetry.acked_bitrate_bps,
@@ -570,8 +587,9 @@ class TransportCongestionController:
             "probe_estimate_bps=%d "
             "link_capacity_bps=%d link_lower_bps=%d link_upper_bps=%d "
             "loss_sample=%.3f loss_avg=%.3f "
-            "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
-            "overuse_time_ms=%.3f groups=%d group_bytes=%d "
+            "trend_ms=%.3f raw_trend=%.6f threshold_ms=%.3f "
+            "acc_delay_ms=%.3f smooth_delay_ms=%.3f trend_window_ms=%.3f "
+            "overuse_count=%d overuse_time_ms=%.3f groups=%d group_bytes=%d "
             "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
             "senders=[%s]",
             telemetry.feedback_count,
@@ -618,7 +636,11 @@ class TransportCongestionController:
             telemetry.loss_sample,
             telemetry.loss_average,
             telemetry.trend_ms,
+            telemetry.raw_trend,
             telemetry.trend_threshold_ms,
+            telemetry.accumulated_delay_ms,
+            telemetry.smoothed_delay_ms,
+            telemetry.trend_window_ms,
             telemetry.overuse_counter,
             telemetry.overuse_time_ms,
             telemetry.groups_seen,
