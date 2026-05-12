@@ -191,6 +191,10 @@ class TransportCongestionController:
     def get_pacer_config(self):
         return self.__transport_control.get_pacer_config()
 
+    def has_probe_pending(self) -> bool:
+        config = self.__transport_control.get_pacer_config()
+        return self.__rtp_pacer.is_probe_pending(config)
+
     async def pace_rtp_packet(
         self, *, size_bytes: int, now_ms: Optional[int] = None
     ) -> PacedPacketInfo:

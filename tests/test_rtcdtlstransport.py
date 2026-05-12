@@ -1,7 +1,7 @@
 import asyncio
 import datetime
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from aiortc.rtcdtlstransport import (
     SRTP_AEAD_AES_256_GCM,
@@ -36,7 +36,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from pycc import TRANSPORT_CC_URI
+from pycc import TRANSPORT_CC_URI, PacedPacketInfo
 
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -73,7 +73,41 @@ class DummyRtpReceiver:
 
 
 class DummyRtpSender:
+    kind = "video"
     _ssrc = 0
+
+    def __init__(self) -> None:
+        self._sequence_number = 1000
+        self._extensions_map = HeaderExtensionsMap()
+        self._extensions_map.configure(
+            RTCRtpSendParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(id=5, uri=TRANSPORT_CC_URI)
+                ]
+            )
+        )
+
+    def _get_target_bitrate(self) -> int:
+        return 1_000_000
+
+    def _get_bitrate_bounds(self) -> tuple[int, int]:
+        return (500_000, 3_000_000)
+
+    def _set_target_bitrate(self, bitrate: int) -> None:
+        pass
+
+    def _create_rtp_padding_packet(
+        self, padding_size: int
+    ) -> tuple[RtpPacket, HeaderExtensionsMap]:
+        packet = RtpPacket(
+            payload_type=100,
+            sequence_number=self._sequence_number,
+            timestamp=123456,
+            ssrc=self._ssrc,
+        )
+        packet.padding_size = padding_size
+        self._sequence_number += 1
+        return packet, self._extensions_map
 
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
         pass
@@ -311,6 +345,39 @@ class RTCDtlsTransportTest(TestCase):
             [packet.extensions.transport_sequence_number for packet in sent_packets],
             [0, 1],
         )
+
+    @asynctest
+    async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        sender = DummyRtpSender()
+        sender._ssrc = 1234
+        session._rtp_router.register_sender(sender, sender._ssrc)
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, sender._extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+        session._congestion_controller.has_probe_pending = Mock(return_value=True)
+        session._congestion_controller.pace_rtp_packet = AsyncMock(
+            return_value=PacedPacketInfo(probe_cluster_id=7)
+        )
+        session._congestion_controller.next_transport_sequence_number = Mock(
+            return_value=55
+        )
+        session._congestion_controller.on_packet_sent = Mock()
+
+        sent = await session._send_rtp_probe_padding_packet()
+
+        self.assertTrue(sent)
+        self.assertEqual(len(sent_packets), 1)
+        self.assertEqual(sent_packets[0].extensions.transport_sequence_number, 55)
+        self.assertEqual(sent_packets[0].padding_size, 255)
+        session._congestion_controller.on_packet_sent.assert_called_once()
 
     @asynctest
     async def test_rtp_malformed(self) -> None:

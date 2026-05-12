@@ -189,6 +189,28 @@ class AsyncRtpPacerTest(TestCase):
         self.assertTrue(second.is_probe)
         self.assertFalse(third.is_probe)
 
+    @asynctest
+    async def test_pacer_reports_pending_probe_until_cluster_minimum(self) -> None:
+        pacer = AsyncRtpPacer()
+        config = PacerConfig(
+            send_bitrate_bps=300_000,
+            window_us=40_000,
+            probe_cluster=ProbeClusterConfig(
+                id=11,
+                target_bitrate_bps=6_000_000,
+                target_duration_us=2_000,
+                target_probe_count=2,
+            ),
+        )
+
+        self.assertTrue(pacer.is_probe_pending(config))
+
+        await pacer.pace(size_bytes=1500, config=config, now_ms=0)
+        self.assertTrue(pacer.is_probe_pending(config))
+        await pacer.pace(size_bytes=1500, config=config, now_ms=0)
+
+        self.assertFalse(pacer.is_probe_pending(config))
+
     def test_handle_feedback_activates_provider(self) -> None:
         provider = PyccTransportControlProvider()
         sequence_number = provider.next_transport_sequence_number()

@@ -384,6 +384,10 @@ class AsyncRtpPacer:
                     )
             return pacing_info
 
+    def is_probe_pending(self, config: PacerConfig) -> bool:
+        probe = config.probe_cluster
+        return probe is not None and probe.id not in self._completed_probe_cluster_ids
+
     def _wait_time_us(self, size_bytes: int, now_us: int) -> int:
         assert self._model is not None
         self._model.update(now_us)

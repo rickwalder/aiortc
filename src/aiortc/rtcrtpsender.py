@@ -110,9 +110,12 @@ class RTCRtpSender:
         self.__mid: Optional[str] = None
         self.__rtp_exited = asyncio.Event()
         self.__rtp_header_extensions_map = rtp.HeaderExtensionsMap()
+        self.__rtp_payload_type: Optional[int] = None
+        self.__rtp_sequence_number = random_sequence_number()
         self.__rtp_started = asyncio.Event()
         self.__rtp_task: Optional[asyncio.Future[None]] = None
         self.__rtp_history: dict[int, RtpPacket] = {}
+        self.__rtp_timestamp_origin = random32()
         self.__rtcp_exited = asyncio.Event()
         self.__rtcp_started = asyncio.Event()
         self.__rtcp_task: Optional[asyncio.Future[None]] = None
@@ -367,6 +370,30 @@ class RTCRtpSender:
         """
         self.__force_keyframe = True
 
+    def _create_rtp_padding_packet(
+        self, padding_size: int
+    ) -> Optional[tuple[RtpPacket, rtp.HeaderExtensionsMap]]:
+        if (
+            self.__kind != "video"
+            or self.__rtp_payload_type is None
+            or self.__rtp_timestamp == 0
+            or padding_size <= 0
+        ):
+            return None
+
+        packet = RtpPacket(
+            payload_type=self.__rtp_payload_type,
+            sequence_number=self.__rtp_sequence_number,
+            timestamp=self.__rtp_timestamp,
+            ssrc=self._ssrc,
+        )
+        packet.padding_size = min(255, padding_size)
+        packet.extensions.mid = self.__mid
+
+        self.__rtp_sequence_number = uint16_add(self.__rtp_sequence_number, 1)
+        self.__packet_count += 1
+        return packet, self.__rtp_header_extensions_map
+
     def _get_target_bitrate(self) -> Optional[int]:
         if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
             return self.__encoder.target_bitrate
@@ -392,9 +419,8 @@ class RTCRtpSender:
     async def _run_rtp(self, codec: RTCRtpCodecParameters) -> None:
         self.__log_debug("- RTP started")
         self.__rtp_started.set()
+        self.__rtp_payload_type = codec.payloadType
 
-        sequence_number = random_sequence_number()
-        timestamp_origin = random32()
         try:
             while True:
                 if not self.__track:
@@ -407,12 +433,14 @@ class RTCRtpSender:
                 if enc_frame is None:
                     continue
 
-                timestamp = uint32_add(timestamp_origin, enc_frame.timestamp)
+                timestamp = uint32_add(
+                    self.__rtp_timestamp_origin, enc_frame.timestamp
+                )
 
                 for i, payload in enumerate(enc_frame.payloads):
                     packet = RtpPacket(
                         payload_type=codec.payloadType,
-                        sequence_number=sequence_number,
+                        sequence_number=self.__rtp_sequence_number,
                         timestamp=timestamp,
                     )
                     packet.ssrc = self._ssrc
@@ -429,6 +457,9 @@ class RTCRtpSender:
                     self.__rtp_history[packet.sequence_number % RTP_HISTORY_SIZE] = (
                         packet
                     )
+                    self.__rtp_sequence_number = uint16_add(
+                        self.__rtp_sequence_number, 1
+                    )
                     await self.transport._send_rtp_packet(
                         packet,
                         self.__rtp_header_extensions_map,
@@ -440,7 +471,6 @@ class RTCRtpSender:
                     self.__rtp_timestamp = packet.timestamp
                     self.__octet_count += len(payload)
                     self.__packet_count += 1
-                    sequence_number = uint16_add(sequence_number, 1)
         except (asyncio.CancelledError, ConnectionError, MediaStreamError):
             pass
         except Exception:
@@ -455,6 +485,7 @@ class RTCRtpSender:
 
         # release encoder
         self.__encoder = None
+        self.__rtp_payload_type = None
 
         self.__log_debug("- RTP finished")
         self.__rtp_exited.set()

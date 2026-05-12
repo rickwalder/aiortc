@@ -248,6 +248,10 @@ class RtpSender(Protocol):
 
     def _set_target_bitrate(self, bitrate: int) -> None: ...
 
+    def _create_rtp_padding_packet(
+        self, padding_size: int
+    ) -> Optional[tuple[RtpPacket, rtp.HeaderExtensionsMap]]: ...
+
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
 
 
@@ -373,6 +377,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_router = RtpRouter()
         self._rtp_send_lock = asyncio.Lock()
         self._congestion_controller = TransportCongestionController()
+        self._rtp_probe_padding_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
         self._task: Optional[asyncio.Future[None]] = None
@@ -557,6 +562,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self.__log_debug("- DTLS handshake complete")
         self._set_state(State.CONNECTED)
         self._task = asyncio.ensure_future(self.__run())
+        self._rtp_probe_padding_task = asyncio.ensure_future(
+            self.__run_rtp_probe_padding()
+        )
 
     async def stop(self) -> None:
         """
@@ -565,6 +573,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         if self._task is not None:
             self._task.cancel()
             self._task = None
+        if self._rtp_probe_padding_task is not None:
+            self._rtp_probe_padding_task.cancel()
+            self._rtp_probe_padding_task = None
 
         if self._ssl and self._state in [State.CONNECTING, State.CONNECTED]:
             try:
@@ -798,6 +809,75 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     def _set_role(self, role: str) -> None:
         self._role = role
+
+    async def __run_rtp_probe_padding(self) -> None:
+        try:
+            while True:
+                if not self._congestion_controller.has_probe_pending():
+                    await asyncio.sleep(0.01)
+                    continue
+
+                sent = await self._send_rtp_probe_padding_packet()
+                if not sent:
+                    await asyncio.sleep(0.02)
+                else:
+                    await asyncio.sleep(0)
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        except Exception:
+            self.__log_warning(traceback.format_exc())
+
+    def __get_rtp_probe_padding_sender(self) -> Optional[RtpSender]:
+        for sender in self._rtp_router.senders.values():
+            if getattr(sender, "kind", None) == "video":
+                return sender
+        return None
+
+    async def _send_rtp_probe_padding_packet(self) -> bool:
+        async with self._rtp_send_lock:
+            if not self._congestion_controller.has_probe_pending():
+                return False
+
+            sender = self.__get_rtp_probe_padding_sender()
+            if sender is None:
+                return False
+
+            pacing_info = await self._congestion_controller.pace_rtp_packet(
+                size_bytes=320,
+            )
+            if not pacing_info.is_probe:
+                return False
+
+            padding_packet = sender._create_rtp_padding_packet(255)
+            if padding_packet is None:
+                return False
+            packet, extensions_map = padding_packet
+            if not extensions_map.has_transport_sequence_number:
+                return False
+
+            packet.extensions.transport_sequence_number = (
+                self._congestion_controller.next_transport_sequence_number()
+            )
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            packet_bytes = packet.serialize(extensions_map)
+
+            await self._send_rtp(packet_bytes)
+
+            transport_sequence_number = packet.extensions.transport_sequence_number
+            assert transport_sequence_number is not None
+            self._congestion_controller.on_packet_sent(
+                transport_sequence_number=transport_sequence_number,
+                send_time_us=clock.current_monotonic_us(),
+                size_bytes=len(packet_bytes),
+                payload_size_bytes=0,
+                ssrc=packet.ssrc,
+                rtp_sequence_number=packet.sequence_number,
+                is_retransmission=False,
+                pacing_info=pacing_info,
+            )
+            return True
 
     def _set_state(self, state: State) -> None:
         if state != self._state:
