@@ -403,14 +403,6 @@ class RTCRtpSender:
                 if enc_frame is None:
                     continue
 
-                if self.__kind == "video":
-                    self.__transport._congestion_controller.observe_encoded_frame(
-                        ssrc=self._ssrc,
-                        payload_bytes=sum(
-                            len(payload) for payload in enc_frame.payloads
-                        ),
-                    )
-
                 timestamp = uint32_add(timestamp_origin, enc_frame.timestamp)
 
                 for i, payload in enumerate(enc_frame.payloads):
@@ -465,6 +457,7 @@ class RTCRtpSender:
                             transport_sequence_number=transport_sequence_number,
                             send_time_ms=clock.current_ms(),
                             size_bytes=len(packet_bytes),
+                            payload_size_bytes=len(payload),
                             ssrc=packet.ssrc,
                             rtp_sequence_number=packet.sequence_number,
                         )

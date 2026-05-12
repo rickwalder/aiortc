@@ -142,10 +142,12 @@ class TransportCongestionController:
         transport_sequence_number: int,
         send_time_ms: int,
         size_bytes: int,
+        payload_size_bytes: int = 0,
         ssrc: int,
         rtp_sequence_number: int,
         is_retransmission: bool = False,
     ) -> None:
+        self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
         self.__transport_control.on_packet_sent(
             TransportControlSentPacket(
                 transport_sequence_number=transport_sequence_number,
