@@ -28,7 +28,9 @@ def replay_trace(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     updates = []
 
     for record in records:
-        if record.get("type") == "sent":
+        if record.get("type") == "trace-start":
+            controller = GoogCcController(RateConstraints())
+        elif record.get("type") == "sent":
             controller.on_packet_sent(
                 SentPacket(
                     transport_sequence_number=record["transport_sequence_number"],
