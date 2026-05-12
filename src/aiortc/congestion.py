@@ -315,7 +315,7 @@ class TransportCongestionController:
             logger.debug(
                 "transport-cc target update target_bps=%d stable_bps=%d "
                 "previous_bps=%s reason=%s delay_usage=%s aimd=%s acked_bps=%d "
-                "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+                "in_alr=%s alr_budget=%.2f loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
                 "trend_ms=%.3f threshold_ms=%.3f send_delta_ms=%.3f "
                 "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
                 update.target_bitrate_bps,
@@ -325,6 +325,8 @@ class TransportCongestionController:
                 telemetry.delay_usage,
                 telemetry.aimd_state,
                 telemetry.acked_bitrate_bps,
+                telemetry.in_alr,
+                telemetry.alr_budget_ratio,
                 update.loss_fraction,
                 update.rtt_us / 1000,
                 telemetry.trend_ms,
@@ -350,7 +352,7 @@ class TransportCongestionController:
             level,
             "transport-cc target update target_bps=%d stable_bps=%d previous_bps=%s "
             "reason=%s delay_usage=%s aimd=%s acked_bps=%d "
-            "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+            "in_alr=%s alr_budget=%.2f loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
             "overuse_time_ms=%.3f send_delta_ms=%.3f recv_delta_ms=%.3f "
             "delay_delta_ms=%.3f group_bytes=%d",
@@ -361,6 +363,8 @@ class TransportCongestionController:
             telemetry.delay_usage,
             telemetry.aimd_state,
             telemetry.acked_bitrate_bps,
+            telemetry.in_alr,
+            telemetry.alr_budget_ratio,
             update.loss_fraction,
             telemetry.loss_sample,
             update.rtt_us / 1000,
@@ -387,6 +391,7 @@ class TransportCongestionController:
             level,
             "transport-cc delay state %s -> %s trend_ms=%.3f threshold_ms=%.3f "
             "overuse_count=%d overuse_time_ms=%.3f acked_bps=%d "
+            "in_alr=%s alr_budget=%.2f "
             "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
             "group_bytes=%d groups=%d",
             previous or "unknown",
@@ -396,6 +401,8 @@ class TransportCongestionController:
             telemetry.overuse_counter,
             telemetry.overuse_time_ms,
             telemetry.acked_bitrate_bps,
+            telemetry.in_alr,
+            telemetry.alr_budget_ratio,
             telemetry.last_send_delta_ms,
             telemetry.last_receive_delta_ms,
             telemetry.last_delay_delta_ms,
@@ -451,6 +458,9 @@ class TransportCongestionController:
                 * 8
                 / elapsed_s
             )
+        target_bitrate = max(1, telemetry.last_target_bitrate_bps)
+        sent_fill_ratio = sent_rate_bps / target_bitrate
+        acked_fill_ratio = acked_rate_bps / target_bitrate
         self.__last_telemetry_snapshot = TelemetrySnapshot(
             now_ms=now_ms,
             sent_bytes=telemetry.sent_bytes,
@@ -481,9 +491,11 @@ class TransportCongestionController:
             "target_bps=%d pacer_bps=%d "
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
             "sent_bps=%d acked_bps=%d lost_bps=%d "
+            "sent_fill=%.2f acked_fill=%.2f "
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
-            "acked_estimate_bps=%d loss_sample=%.3f loss_avg=%.3f "
+            "acked_estimate_bps=%d in_alr=%s alr_budget=%.2f "
+            "loss_sample=%.3f loss_avg=%.3f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
             "overuse_time_ms=%.3f groups=%d group_bytes=%d "
             "send_delta_ms=%.3f recv_delta_ms=%.3f delay_delta_ms=%.3f "
@@ -503,6 +515,8 @@ class TransportCongestionController:
             sent_rate_bps,
             acked_rate_bps,
             lost_rate_bps,
+            sent_fill_ratio,
+            acked_fill_ratio,
             telemetry.data_in_flight_bytes,
             telemetry.oldest_in_flight_age_ms,
             telemetry.packet_history_size,
@@ -512,6 +526,8 @@ class TransportCongestionController:
             telemetry.delay_usage,
             telemetry.aimd_state,
             telemetry.acked_bitrate_bps,
+            telemetry.in_alr,
+            telemetry.alr_budget_ratio,
             telemetry.loss_sample,
             telemetry.loss_average,
             telemetry.trend_ms,

@@ -68,6 +68,8 @@ class TransportControlTelemetry:
     delay_usage: str = "normal"
     aimd_state: str = "increase"
     acked_bitrate_bps: int = 0
+    in_alr: bool = False
+    alr_budget_ratio: float = 0.0
     loss_sample: float = 0.0
     loss_average: float = 0.0
     trend_ms: float = 0.0
@@ -257,6 +259,8 @@ class PyccTransportControlProvider:
             delay_usage=diagnostics.delay_usage,
             aimd_state=diagnostics.aimd_state,
             acked_bitrate_bps=diagnostics.acked_bitrate_bps or 0,
+            in_alr=diagnostics.in_alr,
+            alr_budget_ratio=diagnostics.alr_budget_ratio,
             loss_sample=diagnostics.loss_sample,
             loss_average=diagnostics.loss_average,
             trend_ms=diagnostics.trend_ms,
