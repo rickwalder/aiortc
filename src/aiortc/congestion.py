@@ -315,7 +315,8 @@ class TransportCongestionController:
             logger.debug(
                 "transport-cc target update target_bps=%d stable_bps=%d "
                 "previous_bps=%s reason=%s delay_usage=%s aimd=%s acked_bps=%d "
-                "in_alr=%s alr_budget=%.2f loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+                "in_alr=%s alr_budget=%.2f link_capacity_bps=%d "
+                "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
                 "trend_ms=%.3f threshold_ms=%.3f send_delta_ms=%.3f "
                 "recv_delta_ms=%.3f delay_delta_ms=%.3f group_bytes=%d",
                 update.target_bitrate_bps,
@@ -327,6 +328,7 @@ class TransportCongestionController:
                 telemetry.acked_bitrate_bps,
                 telemetry.in_alr,
                 telemetry.alr_budget_ratio,
+                telemetry.link_capacity_bps,
                 update.loss_fraction,
                 update.rtt_us / 1000,
                 telemetry.trend_ms,
@@ -352,7 +354,8 @@ class TransportCongestionController:
             level,
             "transport-cc target update target_bps=%d stable_bps=%d previous_bps=%s "
             "reason=%s delay_usage=%s aimd=%s acked_bps=%d "
-            "in_alr=%s alr_budget=%.2f loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
+            "in_alr=%s alr_budget=%.2f link_capacity_bps=%d "
+            "loss=%.3f loss_sample=%.3f rtt_ms=%.1f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
             "overuse_time_ms=%.3f send_delta_ms=%.3f recv_delta_ms=%.3f "
             "delay_delta_ms=%.3f group_bytes=%d",
@@ -365,6 +368,7 @@ class TransportCongestionController:
             telemetry.acked_bitrate_bps,
             telemetry.in_alr,
             telemetry.alr_budget_ratio,
+            telemetry.link_capacity_bps,
             update.loss_fraction,
             telemetry.loss_sample,
             update.rtt_us / 1000,
@@ -495,6 +499,7 @@ class TransportCongestionController:
             "in_flight=%d oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
             "acked_estimate_bps=%d in_alr=%s alr_budget=%.2f "
+            "link_capacity_bps=%d link_lower_bps=%d link_upper_bps=%d "
             "loss_sample=%.3f loss_avg=%.3f "
             "trend_ms=%.3f threshold_ms=%.3f overuse_count=%d "
             "overuse_time_ms=%.3f groups=%d group_bytes=%d "
@@ -528,6 +533,9 @@ class TransportCongestionController:
             telemetry.acked_bitrate_bps,
             telemetry.in_alr,
             telemetry.alr_budget_ratio,
+            telemetry.link_capacity_bps,
+            telemetry.link_capacity_lower_bps,
+            telemetry.link_capacity_upper_bps,
             telemetry.loss_sample,
             telemetry.loss_average,
             telemetry.trend_ms,

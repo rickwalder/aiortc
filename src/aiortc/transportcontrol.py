@@ -70,6 +70,9 @@ class TransportControlTelemetry:
     acked_bitrate_bps: int = 0
     in_alr: bool = False
     alr_budget_ratio: float = 0.0
+    link_capacity_bps: int = 0
+    link_capacity_lower_bps: int = 0
+    link_capacity_upper_bps: int = 0
     loss_sample: float = 0.0
     loss_average: float = 0.0
     trend_ms: float = 0.0
@@ -261,6 +264,9 @@ class PyccTransportControlProvider:
             acked_bitrate_bps=diagnostics.acked_bitrate_bps or 0,
             in_alr=diagnostics.in_alr,
             alr_budget_ratio=diagnostics.alr_budget_ratio,
+            link_capacity_bps=diagnostics.link_capacity_bps or 0,
+            link_capacity_lower_bps=diagnostics.link_capacity_lower_bps or 0,
+            link_capacity_upper_bps=diagnostics.link_capacity_upper_bps or 0,
             loss_sample=diagnostics.loss_sample,
             loss_average=diagnostics.loss_average,
             trend_ms=diagnostics.trend_ms,
