@@ -52,7 +52,12 @@ HEADER_EXTENSIONS: dict[str, list[RTCRtpHeaderExtensionParameters]] = {
             id=2, uri="urn:ietf:params:rtp-hdrext:ssrc-audio-level"
         ),
     ],
-    "video": [
+    "video": [],
+}
+
+
+def _build_video_header_extensions() -> list[RTCRtpHeaderExtensionParameters]:
+    return [
         RTCRtpHeaderExtensionParameters(
             id=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
         ),
@@ -60,11 +65,12 @@ HEADER_EXTENSIONS: dict[str, list[RTCRtpHeaderExtensionParameters]] = {
             id=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
         ),
         *get_transport_control_capabilities("video").rtp_header_extensions,
-    ],
-}
+    ]
 
 
 def init_codecs() -> None:
+    CODECS["video"] = []
+    HEADER_EXTENSIONS["video"] = _build_video_header_extensions()
     dynamic_pt = 97
 
     def add_video_codec(

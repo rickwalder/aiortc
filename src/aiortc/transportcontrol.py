@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,8 @@ from .transporttrace import TransportCcTraceWriter
 
 RTCP_RTPFB = 205
 TRANSPORT_CC_HEADER_EXTENSION_ID = 5
+TRANSPORT_CC_DISABLE_ENV = "AIORTC_DISABLE_TRANSPORT_CC"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -106,8 +109,15 @@ class TransportControlTelemetry:
     last_probe_bitrate_bps: int = 0
 
 
-def get_transport_control_capabilities(kind: str) -> TransportControlCapabilities:
+def is_transport_control_enabled(kind: str) -> bool:
     if kind != "video":
+        return False
+    disabled = os.environ.get(TRANSPORT_CC_DISABLE_ENV, "")
+    return disabled.lower() not in _TRUE_ENV_VALUES
+
+
+def get_transport_control_capabilities(kind: str) -> TransportControlCapabilities:
+    if not is_transport_control_enabled(kind):
         return TransportControlCapabilities([], [], [])
 
     return TransportControlCapabilities(

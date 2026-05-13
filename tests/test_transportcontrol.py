@@ -1,18 +1,22 @@
 import json
+import os
 import tempfile
 from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
-from aiortc.codecs import CODECS, HEADER_EXTENSIONS, is_rtx
+from aiortc.codecs import CODECS, HEADER_EXTENSIONS, init_codecs, is_rtx
 from aiortc.congestion import TransportCongestionController
+from aiortc.rtcrtpparameters import RTCRtcpFeedback
 from aiortc.rtp import RtcpPsfbPacket, RtcpTransportLayerCcPacket, RtpPacket
 from aiortc.transportcontrol import (
     RTCP_RTPFB,
+    TRANSPORT_CC_DISABLE_ENV,
     TRANSPORT_CC_HEADER_EXTENSION_ID,
     AsyncRtpPacer,
     PyccTransportControlProvider,
     TransportControlSentPacket,
     get_transport_control_capabilities,
+    is_transport_control_enabled,
 )
 from aiortc.transporttrace import TransportCcTraceWriter
 from pycc import RTPFB_TRANSPORT_CC_FMT, TRANSPORT_CC_URI
@@ -68,6 +72,15 @@ class TransportControlCapabilitiesTest(TestCase):
             [(RTCP_RTPFB, RTPFB_TRANSPORT_CC_FMT)],
         )
 
+    def test_disable_env_suppresses_transport_cc_capabilities(self) -> None:
+        with patch.dict(os.environ, {TRANSPORT_CC_DISABLE_ENV: "1"}):
+            capabilities = get_transport_control_capabilities("video")
+
+            self.assertFalse(is_transport_control_enabled("video"))
+        self.assertEqual(capabilities.rtcp_feedback, [])
+        self.assertEqual(capabilities.rtp_header_extensions, [])
+        self.assertEqual(capabilities.rtcp_feedback_formats, [])
+
     def test_video_codec_registry_includes_transport_cc_capabilities(self) -> None:
         capabilities = get_transport_control_capabilities("video")
         transport_cc_uri = capabilities.rtp_header_extensions[0].uri
@@ -80,6 +93,24 @@ class TransportControlCapabilitiesTest(TestCase):
         for codec in CODECS["video"]:
             if not is_rtx(codec):
                 self.assertIn(transport_cc_feedback, codec.rtcpFeedback)
+
+    def test_disable_env_removes_transport_cc_from_codec_registry(self) -> None:
+        try:
+            with patch.dict(os.environ, {TRANSPORT_CC_DISABLE_ENV: "1"}):
+                init_codecs()
+
+                self.assertNotIn(
+                    TRANSPORT_CC_URI,
+                    [extension.uri for extension in HEADER_EXTENSIONS["video"]],
+                )
+                for codec in CODECS["video"]:
+                    if not is_rtx(codec):
+                        self.assertNotIn(
+                            RTCRtcpFeedback(type="transport-cc"),
+                            codec.rtcpFeedback,
+                        )
+        finally:
+            init_codecs()
 
 
 class PyccTransportControlProviderTest(TestCase):
