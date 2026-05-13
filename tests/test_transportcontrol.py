@@ -1,11 +1,11 @@
 import json
 import tempfile
 from unittest import TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiortc.codecs import CODECS, HEADER_EXTENSIONS, is_rtx
 from aiortc.congestion import TransportCongestionController
-from aiortc.rtp import RtcpTransportLayerCcPacket, RtpPacket
+from aiortc.rtp import RtcpPsfbPacket, RtcpTransportLayerCcPacket, RtpPacket
 from aiortc.transportcontrol import (
     RTCP_RTPFB,
     TRANSPORT_CC_HEADER_EXTENSION_ID,
@@ -338,6 +338,90 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(twcc.sender_ssrc, 4321)
         self.assertEqual(twcc.media_ssrc, 1234)
         self.assertEqual(twcc.base_sequence_number, 77)
+
+    def test_incoming_twcc_feedback_respects_receiver_cadence(self) -> None:
+        controller = TransportCongestionController()
+        receiver = DummyReceiver()
+        controller.register_receiver(receiver)
+
+        first = RtpPacket(payload_type=96, sequence_number=1, timestamp=2, ssrc=1234)
+        first.extensions.transport_sequence_number = 10
+        second = RtpPacket(payload_type=96, sequence_number=2, timestamp=3, ssrc=1234)
+        second.extensions.transport_sequence_number = 11
+        third = RtpPacket(payload_type=96, sequence_number=3, timestamp=4, ssrc=1234)
+        third.extensions.transport_sequence_number = 12
+
+        first_feedback = controller.observe_incoming_rtp(receiver, first, 100)
+        second_feedback = controller.observe_incoming_rtp(receiver, second, 150)
+        third_feedback = controller.observe_incoming_rtp(receiver, third, 200)
+
+        self.assertEqual(len(first_feedback), 1)
+        self.assertEqual(second_feedback, [])
+        self.assertEqual(len(third_feedback), 1)
+        self.assertIsInstance(third_feedback[0], RtcpTransportLayerCcPacket)
+        twcc = third_feedback[0].feedback
+        self.assertEqual(twcc.base_sequence_number, 11)
+        self.assertEqual(
+            [packet.sequence_number for packet in twcc.packets],
+            [11, 12],
+        )
+
+    def test_incoming_twcc_feedback_reports_missing_sequences(self) -> None:
+        controller = TransportCongestionController()
+        receiver = DummyReceiver()
+        controller.register_receiver(receiver)
+
+        first = RtpPacket(payload_type=96, sequence_number=1, timestamp=2, ssrc=1234)
+        first.extensions.transport_sequence_number = 10
+        third = RtpPacket(payload_type=96, sequence_number=3, timestamp=4, ssrc=1234)
+        third.extensions.transport_sequence_number = 12
+
+        controller.observe_incoming_rtp(receiver, first, 100)
+        feedback = controller.observe_incoming_rtp(receiver, third, 200)
+
+        self.assertEqual(len(feedback), 1)
+        self.assertIsInstance(feedback[0], RtcpTransportLayerCcPacket)
+        twcc = feedback[0].feedback
+        self.assertEqual(twcc.base_sequence_number, 11)
+        self.assertEqual(
+            [packet.received for packet in twcc.packets],
+            [False, True],
+        )
+
+    def test_incoming_twcc_suppresses_remb_fallback_once_active(self) -> None:
+        controller = TransportCongestionController()
+        receiver = DummyReceiver()
+        controller.register_receiver(receiver)
+        estimator = controller._TransportCongestionController__remote_bitrate_estimator
+        estimator.add = Mock(return_value=(1_000_000, [1234]))
+
+        remb_packet = RtpPacket(
+            payload_type=96,
+            sequence_number=1,
+            timestamp=2,
+            ssrc=1234,
+        )
+        remb_packet.extensions.abs_send_time = 123
+
+        feedback = controller.observe_incoming_rtp(receiver, remb_packet, 100)
+        self.assertEqual(len(feedback), 1)
+        self.assertIsInstance(feedback[0], RtcpPsfbPacket)
+
+        twcc_packet = RtpPacket(
+            payload_type=96,
+            sequence_number=2,
+            timestamp=3,
+            ssrc=1234,
+        )
+        twcc_packet.extensions.transport_sequence_number = 10
+        controller.observe_incoming_rtp(receiver, twcc_packet, 200)
+
+        estimator.add.reset_mock()
+        self.assertEqual(
+            controller.observe_incoming_rtp(receiver, remb_packet, 300),
+            [],
+        )
+        estimator.add.assert_not_called()
 
     def test_get_pacer_config_delegates_to_provider(self) -> None:
         controller = TransportCongestionController()

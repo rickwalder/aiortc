@@ -26,12 +26,14 @@ from aiortc.rtp import (
     AnyRtcpPacket,
     HeaderExtensionsMap,
     RtcpByePacket,
+    RtcpPacket,
     RtcpPsfbPacket,
     RtcpReceiverInfo,
     RtcpRrPacket,
     RtcpRtpfbPacket,
     RtcpSenderInfo,
     RtcpSrPacket,
+    RtcpTransportLayerCcPacket,
     RtpPacket,
     pack_remb_fci,
 )
@@ -111,6 +113,13 @@ class DummyRtpSender:
 
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
         pass
+
+
+class TwccDummyRtpReceiver(DummyRtpReceiver):
+    kind = "video"
+
+    def _get_rtcp_ssrc(self) -> int:
+        return 4321
 
 
 class RTCCertificateTest(TestCase):
@@ -474,6 +483,122 @@ class RTCDtlsTransportTest(TestCase):
         self.assertEqual(sent_packets[0].extensions.transport_sequence_number, 55)
         self.assertEqual(sent_packets[0].padding_size, 255)
         session._congestion_controller.on_packet_sent.assert_called_once()
+
+    @asynctest
+    async def test_handle_rtp_data_emits_twcc_feedback(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        receiver = TwccDummyRtpReceiver()
+        parameters = RTCRtpReceiveParameters(
+            codecs=[
+                RTCRtpCodecParameters(
+                    mimeType="video/VP8",
+                    clockRate=90000,
+                    payloadType=96,
+                )
+            ],
+            encodings=[RTCRtpDecodingParameters(ssrc=1234, payloadType=96)],
+            headerExtensions=[
+                RTCRtpHeaderExtensionParameters(id=5, uri=TRANSPORT_CC_URI)
+            ],
+        )
+        session._register_rtp_receiver(receiver, parameters)
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(parameters)
+        sent_rtcp: list[AnyRtcpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_rtcp.extend(RtcpPacket.parse(data))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(
+            payload_type=96,
+            sequence_number=1000,
+            timestamp=123456,
+            ssrc=1234,
+        )
+        packet.extensions.transport_sequence_number = 55
+        packet.payload = b"abc"
+
+        await session._handle_rtp_data(packet.serialize(extensions_map), 100)
+
+        self.assertEqual(len(receiver.rtp_packets), 1)
+        self.assertEqual(
+            receiver.rtp_packets[0].extensions.transport_sequence_number,
+            55,
+        )
+        self.assertEqual(len(sent_rtcp), 1)
+        feedback = sent_rtcp[0]
+        self.assertIsInstance(feedback, RtcpTransportLayerCcPacket)
+        assert isinstance(feedback, RtcpTransportLayerCcPacket)
+        self.assertEqual(feedback.feedback.sender_ssrc, 4321)
+        self.assertEqual(feedback.feedback.media_ssrc, 1234)
+        self.assertEqual(feedback.feedback.base_sequence_number, 55)
+
+    @asynctest
+    async def test_handle_rtp_data_twcc_feedback_reports_missing_packets(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        receiver = TwccDummyRtpReceiver()
+        parameters = RTCRtpReceiveParameters(
+            codecs=[
+                RTCRtpCodecParameters(
+                    mimeType="video/VP8",
+                    clockRate=90000,
+                    payloadType=96,
+                )
+            ],
+            encodings=[RTCRtpDecodingParameters(ssrc=1234, payloadType=96)],
+            headerExtensions=[
+                RTCRtpHeaderExtensionParameters(id=5, uri=TRANSPORT_CC_URI)
+            ],
+        )
+        session._register_rtp_receiver(receiver, parameters)
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(parameters)
+        sent_rtcp: list[AnyRtcpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_rtcp.extend(RtcpPacket.parse(data))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet1 = RtpPacket(
+            payload_type=96,
+            sequence_number=1000,
+            timestamp=123456,
+            ssrc=1234,
+        )
+        packet1.extensions.transport_sequence_number = 55
+        packet1.payload = b"abc"
+        packet3 = RtpPacket(
+            payload_type=96,
+            sequence_number=1002,
+            timestamp=123456,
+            ssrc=1234,
+        )
+        packet3.extensions.transport_sequence_number = 57
+        packet3.payload = b"ghi"
+
+        await session._handle_rtp_data(packet1.serialize(extensions_map), 100)
+        await session._handle_rtp_data(packet3.serialize(extensions_map), 200)
+
+        self.assertEqual(len(sent_rtcp), 2)
+        feedback = sent_rtcp[-1]
+        self.assertIsInstance(feedback, RtcpTransportLayerCcPacket)
+        assert isinstance(feedback, RtcpTransportLayerCcPacket)
+        self.assertEqual(feedback.feedback.base_sequence_number, 56)
+        self.assertEqual(
+            [packet.received for packet in feedback.feedback.packets],
+            [False, True],
+        )
 
     @asynctest
     async def test_rtp_malformed(self) -> None:
