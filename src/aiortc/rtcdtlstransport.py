@@ -6,7 +6,7 @@ import logging
 import os
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Protocol, Type, TypeVar, Union
 
 import pylibsrtp
@@ -264,6 +264,22 @@ class _QueuedRtpPacket:
     payload_size_bytes: int
     is_retransmission: bool
     enqueued_time_us: int
+
+
+def _clone_rtp_packet(packet: RtpPacket) -> RtpPacket:
+    cloned = RtpPacket(
+        payload_type=packet.payload_type,
+        marker=packet.marker,
+        sequence_number=packet.sequence_number,
+        timestamp=packet.timestamp,
+        ssrc=packet.ssrc,
+        payload=packet.payload,
+    )
+    cloned.version = packet.version
+    cloned.csrc = list(packet.csrc)
+    cloned.extensions = replace(packet.extensions)
+    cloned.padding_size = packet.padding_size
+    return cloned
 
 
 class RtpRouter:
@@ -783,6 +799,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         payload_size_bytes: int = 0,
         is_retransmission: bool = False,
     ) -> None:
+        packet = _clone_rtp_packet(packet)
+
         if is_video:
             await self._enqueue_rtp_packet(
                 packet,

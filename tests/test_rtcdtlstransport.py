@@ -351,6 +351,59 @@ class RTCDtlsTransportTest(TestCase):
         )
 
     @asynctest
+    async def test_send_rtp_packet_clones_queued_packet_for_twcc(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(
+            RTCRtpSendParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(
+                        id=5,
+                        uri=TRANSPORT_CC_URI,
+                    )
+                ]
+            )
+        )
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+            is_retransmission=True,
+        )
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+            is_retransmission=True,
+        )
+
+        self.assertIsNone(packet.extensions.transport_sequence_number)
+        self.assertTrue(await session._send_next_rtp_packet_from_queue())
+        self.assertTrue(await session._send_next_rtp_packet_from_queue())
+
+        self.assertEqual(
+            [packet.extensions.transport_sequence_number for packet in sent_packets],
+            [0, 1],
+        )
+
+    @asynctest
     async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(
