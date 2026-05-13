@@ -59,11 +59,27 @@ class AimdRateControlTest(TestCase):
         now_ms = 0
         self.rate_control.set_estimate(bitrate, now_ms)
         estimate = self.rate_control.update(BandwidthUsage.OVERUSING, bitrate, now_ms)
-        self.assertEqual(estimate, 255000)
+        self.assertEqual(estimate, 250000)
 
         self.assertEqual(self.rate_control.state, RateControlState.HOLD)
         self.assertEqual(self.rate_control.avg_max_bitrate_kbps, 300.0)
         self.assertEqual(self.rate_control.var_max_bitrate_kbps, 0.4)
+
+    def test_update_overuse_does_not_increase_bitrate(self) -> None:
+        self.rate_control.set_estimate(300000, 0)
+
+        estimate = self.rate_control.update(BandwidthUsage.OVERUSING, 500000, 10)
+
+        self.assertEqual(estimate, 300000)
+        self.assertEqual(self.rate_control.state, RateControlState.HOLD)
+
+    def test_time_to_reduce_further_uses_rtt_gate(self) -> None:
+        self.rate_control.set_estimate(300000, 0)
+        self.rate_control.update(BandwidthUsage.OVERUSING, 300000, 0)
+
+        self.assertFalse(self.rate_control.time_to_reduce_further(100, 260000))
+        self.assertTrue(self.rate_control.time_to_reduce_further(200, 260000))
+        self.assertTrue(self.rate_control.time_to_reduce_further(100, 120000))
 
     def test_update_underuse(self) -> None:
         bitrate = 300000
@@ -90,7 +106,7 @@ class AimdRateControlTest(TestCase):
         estimate = self.rate_control.update(
             BandwidthUsage.OVERUSING, acked_bitrate, now_ms
         )
-        self.assertEqual(estimate, 85000)
+        self.assertEqual(estimate, 80000)
         self.assertEqual(self.rate_control.near_max, True)
         now_ms += 1000
 
@@ -98,7 +114,7 @@ class AimdRateControlTest(TestCase):
         estimate = self.rate_control.update(
             BandwidthUsage.NORMAL, acked_bitrate, now_ms
         )
-        self.assertEqual(estimate, 85000)
+        self.assertEqual(estimate, 80000)
         self.assertEqual(self.rate_control.near_max, True)
         now_ms += 1000
 
@@ -106,7 +122,7 @@ class AimdRateControlTest(TestCase):
         estimate = self.rate_control.update(
             BandwidthUsage.NORMAL, acked_bitrate, now_ms
         )
-        self.assertEqual(estimate, 94444)
+        self.assertEqual(estimate, 84444)
         self.assertEqual(self.rate_control.near_max, True)
         now_ms += 1000
 
@@ -114,7 +130,7 @@ class AimdRateControlTest(TestCase):
         estimate = self.rate_control.update(
             BandwidthUsage.OVERUSING, acked_bitrate, now_ms
         )
-        self.assertEqual(estimate, 85000)
+        self.assertEqual(estimate, 80000)
         self.assertEqual(self.rate_control.near_max, True)
         now_ms += 1000
 
@@ -158,7 +174,7 @@ class AimdRateControlTest(TestCase):
             estimate = self.rate_control.update(
                 BandwidthUsage.NORMAL, acked_bitrate, now_ms
             )
-        self.assertEqual(estimate, 25000)
+        self.assertEqual(estimate, 30000)
 
     def test_bwe_not_limited_by_decreasing_acked_bitrate(self) -> None:
         acked_bitrate = 100000
@@ -950,6 +966,41 @@ class Stream:
 
 
 class RemoteBitrateEstimatorTest(TestCase):
+    def test_initial_probe_can_seed_bitrate(self) -> None:
+        estimator = RemoteBitrateEstimator()
+        target_bitrate = None
+
+        for index in range(6):
+            res = estimator.add(
+                abs_send_time=(index * 10 * (1 << 18) // 1000) & 0xFFFFFF,
+                arrival_time_ms=index * 10,
+                payload_size=1200,
+                ssrc=1234,
+            )
+            if res is not None:
+                target_bitrate = res[0]
+
+        self.assertEqual(target_bitrate, 961000)
+        self.assertTrue(estimator.rate_control.valid_estimate())
+
+    def test_stream_timeout_removes_inactive_ssrcs(self) -> None:
+        estimator = RemoteBitrateEstimator()
+
+        estimator.add(
+            abs_send_time=0,
+            arrival_time_ms=0,
+            payload_size=1200,
+            ssrc=1234,
+        )
+        estimator.add(
+            abs_send_time=1,
+            arrival_time_ms=2001,
+            payload_size=1200,
+            ssrc=5678,
+        )
+
+        self.assertEqual(list(estimator.ssrcs.keys()), [5678])
+
     def test_capacity_drop(self) -> None:
         estimator = RemoteBitrateEstimator()
         stream = Stream(capacity=500000)
@@ -982,4 +1033,4 @@ class RemoteBitrateEstimatorTest(TestCase):
             )
             if res is not None:
                 target_bitrate = res[0]
-        self.assertEqual(target_bitrate, 214200)
+        self.assertEqual(target_bitrate, 209200)

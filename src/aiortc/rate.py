@@ -1,10 +1,14 @@
 import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
 from aiortc.utils import uint32_add, uint32_gt
 
 BURST_DELTA_THRESHOLD_MS = 5
+MAX_BURST_DURATION_MS = 100
+ARRIVAL_TIME_OFFSET_THRESHOLD_MS = 3000
+REORDERED_RESET_THRESHOLD = 3
 
 # overuse detector
 MAX_ADAPT_OFFSET_MS = 15
@@ -18,6 +22,21 @@ MIN_FRAME_PERIOD_HISTORY_LENGTH = 60
 INTER_ARRIVAL_SHIFT = 26
 TIMESTAMP_GROUP_LENGTH_MS = 5
 TIMESTAMP_TO_MS = 1000.0 / (1 << INTER_ARRIVAL_SHIFT)
+INITIAL_PROBING_INTERVAL_MS = 2000
+MIN_PROBE_PACKET_SIZE = 200
+MIN_CLUSTER_DELTA_MS = 1
+MIN_CLUSTER_SIZE = 4
+MAX_PROBE_PACKETS = 15
+EXPECTED_NUMBER_OF_PROBES = 3
+STREAM_TIMEOUT_MS = 2000
+
+# AIMD rate control
+BACKOFF_FACTOR = 0.85
+BITRATE_INITIALIZATION_TIME_MS = 5000
+MIN_CONFIGURED_BITRATE = 30000
+MAX_CONFIGURED_BITRATE = 30000000
+BITRATE_REDUCTION_INTERVAL_MIN_MS = 10
+BITRATE_REDUCTION_INTERVAL_MAX_MS = 200
 
 
 class BandwidthUsage(Enum):
@@ -36,14 +55,19 @@ class AimdRateControl:
     def __init__(self) -> None:
         self.avg_max_bitrate_kbps: Optional[float] = None
         self.var_max_bitrate_kbps = 0.4
-        self.current_bitrate = 30000000
+        self.current_bitrate = MAX_CONFIGURED_BITRATE
         self.current_bitrate_initialized = False
         self.first_estimated_throughput_time: Optional[int] = None
         self.last_change_ms: Optional[int] = None
+        self.last_decrease_ms: Optional[int] = None
+        self.last_decrease_bps: Optional[int] = None
         self.near_max = False
-        self.latest_estimated_throughput = 30000000
+        self.latest_estimated_throughput = MAX_CONFIGURED_BITRATE
         self.rtt = 200
         self.state = RateControlState.HOLD
+
+    def valid_estimate(self) -> bool:
+        return self.current_bitrate_initialized
 
     def feedback_interval(self) -> int:
         # Match libwebrtc's REMB-era feedback cadence: allocate roughly 5%
@@ -61,6 +85,22 @@ class AimdRateControl:
         self.current_bitrate_initialized = True
         self.last_change_ms = now_ms
 
+    def time_to_reduce_further(self, now_ms: int, estimated_throughput: int) -> bool:
+        if self.last_change_ms is None:
+            return True
+
+        reduction_interval = max(
+            BITRATE_REDUCTION_INTERVAL_MIN_MS,
+            min(BITRATE_REDUCTION_INTERVAL_MAX_MS, self.rtt),
+        )
+        if now_ms - self.last_change_ms >= reduction_interval:
+            return True
+
+        if self.valid_estimate():
+            return estimated_throughput < 0.5 * self.current_bitrate
+
+        return False
+
     def update(
         self,
         bandwidth_usage: BandwidthUsage,
@@ -70,7 +110,10 @@ class AimdRateControl:
         if not self.current_bitrate_initialized and estimated_throughput is not None:
             if self.first_estimated_throughput_time is None:
                 self.first_estimated_throughput_time = now_ms
-            elif now_ms - self.first_estimated_throughput_time > 3000:
+            elif (
+                now_ms - self.first_estimated_throughput_time
+                > BITRATE_INITIALIZATION_TIME_MS
+            ):
                 self.current_bitrate = estimated_throughput
                 self.current_bitrate_initialized = True
 
@@ -119,11 +162,16 @@ class AimdRateControl:
             # we use additive or multiplicative rate increase depending on whether
             # we are close to the maximum throughput
             if self.near_max:
-                new_bitrate += self._additive_rate_increase(self.last_change_ms, now_ms)
+                increased_bitrate = new_bitrate + self._additive_rate_increase(
+                    self.last_change_ms, now_ms
+                )
             else:
-                new_bitrate += self._multiplicative_rate_increase(
+                increased_bitrate = new_bitrate + self._multiplicative_rate_increase(
                     new_bitrate, self.last_change_ms, now_ms
                 )
+            increase_limit = int(1.5 * estimated_throughput) + 10000
+            if new_bitrate < increase_limit:
+                new_bitrate = min(increased_bitrate, increase_limit)
             self.last_change_ms = now_ms
         elif self.state == RateControlState.DECREASE:
             # if the estimated throughput drops significantly,
@@ -140,8 +188,30 @@ class AimdRateControl:
             self._update_max_throughput_estimate(estimated_throughput_kbps)
 
             self.near_max = True
-            new_bitrate = round(0.85 * estimated_throughput)
+            decreased_bitrate = round(BACKOFF_FACTOR * estimated_throughput)
+            if decreased_bitrate > 5000:
+                decreased_bitrate -= 5000
+
+            if (
+                decreased_bitrate > self.current_bitrate
+                and self.avg_max_bitrate_kbps is not None
+            ):
+                decreased_bitrate = round(
+                    BACKOFF_FACTOR * self.avg_max_bitrate_kbps * 1000
+                )
+
+            if decreased_bitrate < self.current_bitrate:
+                new_bitrate = decreased_bitrate
+
+            if (
+                self.current_bitrate_initialized
+                and estimated_throughput < self.current_bitrate
+            ):
+                self.last_decrease_bps = self.current_bitrate - new_bitrate
+
+            self.current_bitrate_initialized = True
             self.last_change_ms = now_ms
+            self.last_decrease_ms = now_ms
             self.state = RateControlState.HOLD
 
         self.current_bitrate = self._clamp_bitrate(new_bitrate, estimated_throughput)
@@ -151,8 +221,7 @@ class AimdRateControl:
         return int((now_ms - last_ms) * self._near_max_rate_increase() / 1000)
 
     def _clamp_bitrate(self, new_bitrate: int, estimated_throughput: int) -> int:
-        max_bitrate = max(int(1.5 * estimated_throughput) + 10000, self.current_bitrate)
-        return min(new_bitrate, max_bitrate)
+        return max(MIN_CONFIGURED_BITRATE, new_bitrate)
 
     def _multiplicative_rate_increase(
         self, new_bitrate: int, last_ms: int, now_ms: int
@@ -168,7 +237,7 @@ class AimdRateControl:
         packets_per_frame = math.ceil(bits_per_frame / (8 * 1200))
         avg_packet_size_bits = bits_per_frame / packets_per_frame
 
-        response_time = self.rtt + 100
+        response_time = (self.rtt + 100) * 2
         return max(4000, int((avg_packet_size_bits * 1000) / response_time))
 
     def _update_max_throughput_estimate(self, estimated_throughput_kbps: float) -> None:
@@ -189,10 +258,15 @@ class AimdRateControl:
 
 class TimestampGroup:
     def __init__(self, timestamp: Optional[int] = None) -> None:
-        self.arrival_time: Optional[int] = None
         self.first_timestamp = timestamp
-        self.last_timestamp = timestamp
+        self.timestamp = timestamp
+        self.first_arrival_time: Optional[int] = None
+        self.complete_time: Optional[int] = None
+        self.last_system_time: Optional[int] = None
         self.size = 0
+
+    def is_first_packet(self) -> bool:
+        return self.complete_time is None
 
 
 class InterArrivalDelta:
@@ -212,49 +286,91 @@ class InterArrival:
     def __init__(self, group_length: int, timestamp_to_ms: float) -> None:
         self.group_length = group_length
         self.timestamp_to_ms = timestamp_to_ms
+        self.burst_grouping = True
+        self.num_consecutive_reordered_packets = 0
         self.current_group: Optional[TimestampGroup] = None
         self.previous_group: Optional[TimestampGroup] = None
 
     def compute_deltas(
-        self, timestamp: int, arrival_time: int, packet_size: int
+        self,
+        timestamp: int,
+        arrival_time: int,
+        packet_size: int,
+        system_time: Optional[int] = None,
     ) -> Optional[InterArrivalDelta]:
+        if system_time is None:
+            system_time = arrival_time
         deltas = None
         if self.current_group is None:
             self.current_group = TimestampGroup(timestamp)
+            self.current_group.first_arrival_time = arrival_time
         elif self.packet_out_of_order(timestamp):
             return deltas
         elif self.new_timestamp_group(timestamp, arrival_time):
             if self.previous_group is not None:
+                timestamp_delta = uint32_add(
+                    self.current_group.timestamp,
+                    -self.previous_group.timestamp,
+                )
+                arrival_time_delta = (
+                    self.current_group.complete_time
+                    - self.previous_group.complete_time
+                )
+                system_time_delta = (
+                    self.current_group.last_system_time
+                    - self.previous_group.last_system_time
+                )
+                if (
+                    arrival_time_delta - system_time_delta
+                    >= ARRIVAL_TIME_OFFSET_THRESHOLD_MS
+                ):
+                    self.reset()
+                    return None
+                if arrival_time_delta < 0:
+                    self.num_consecutive_reordered_packets += 1
+                    if (
+                        self.num_consecutive_reordered_packets
+                        >= REORDERED_RESET_THRESHOLD
+                    ):
+                        self.reset()
+                    return None
+
+                self.num_consecutive_reordered_packets = 0
                 deltas = InterArrivalDelta(
-                    timestamp=uint32_add(
-                        self.current_group.last_timestamp,
-                        -self.previous_group.last_timestamp,
-                    ),
-                    arrival_time=(
-                        self.current_group.arrival_time
-                        - self.previous_group.arrival_time
-                    ),
+                    timestamp=timestamp_delta,
+                    arrival_time=arrival_time_delta,
                     size=self.current_group.size - self.previous_group.size,
                 )
 
             # shift groups
             self.previous_group = self.current_group
             self.current_group = TimestampGroup(timestamp=timestamp)
-        elif uint32_gt(timestamp, self.current_group.last_timestamp):
-            self.current_group.last_timestamp = timestamp
+            self.current_group.first_arrival_time = arrival_time
+        elif uint32_gt(timestamp, self.current_group.timestamp):
+            self.current_group.timestamp = timestamp
 
         self.current_group.size += packet_size
-        self.current_group.arrival_time = arrival_time
+        self.current_group.complete_time = arrival_time
+        self.current_group.last_system_time = system_time
 
         return deltas
 
     def belongs_to_burst(self, timestamp: int, arrival_time: int) -> bool:
-        timestamp_delta = uint32_add(timestamp, -self.current_group.last_timestamp)
+        if not self.burst_grouping:
+            return False
+
+        timestamp_delta = uint32_add(timestamp, -self.current_group.timestamp)
         timestamp_delta_ms = round(self.timestamp_to_ms * timestamp_delta)
-        arrival_time_delta = arrival_time - self.current_group.arrival_time
+        arrival_time_delta = arrival_time - self.current_group.complete_time
+        if timestamp_delta_ms == 0:
+            return True
+
+        propagation_delta_ms = arrival_time_delta - timestamp_delta_ms
         return timestamp_delta_ms == 0 or (
-            (arrival_time_delta - timestamp_delta_ms) < 0
+            propagation_delta_ms < 0
             and arrival_time_delta <= BURST_DELTA_THRESHOLD_MS
+            and arrival_time - self.current_group.first_arrival_time
+            < MAX_BURST_DURATION_MS
         )
 
     def new_timestamp_group(self, timestamp: int, arrival_time: int) -> bool:
@@ -267,6 +383,11 @@ class InterArrival:
     def packet_out_of_order(self, timestamp: int) -> bool:
         timestamp_delta = uint32_add(timestamp, -self.current_group.first_timestamp)
         return timestamp_delta >= 0x80000000
+
+    def reset(self) -> None:
+        self.num_consecutive_reordered_packets = 0
+        self.current_group = None
+        self.previous_group = None
 
 
 class OveruseDetector:
@@ -511,10 +632,36 @@ class RateCounter:
             self._origin_ms += 1
 
 
+@dataclass
+class Probe:
+    send_time_ms: int
+    recv_time_ms: int
+    payload_size: int
+
+
+@dataclass
+class ProbeCluster:
+    send_mean_ms: float = 0.0
+    recv_mean_ms: float = 0.0
+    mean_size: float = 0.0
+    count: int = 0
+    num_above_min_delta: int = 0
+
+    def send_bitrate(self) -> int:
+        if self.send_mean_ms <= 0:
+            return 0
+        return round(self.mean_size * 8 * 1000 / self.send_mean_ms)
+
+    def recv_bitrate(self) -> int:
+        if self.recv_mean_ms <= 0:
+            return 0
+        return round(self.mean_size * 8 * 1000 / self.recv_mean_ms)
+
+
 class RemoteBitrateEstimator:
     def __init__(self) -> None:
         self.incoming_bitrate = RateCounter(1000, 8000)
-        self.incoming_bitrate_initialized = True
+        self.incoming_bitrate_initialized = False
         self.inter_arrival = InterArrival(
             (TIMESTAMP_GROUP_LENGTH_MS << INTER_ARRIVAL_SHIFT) // 1000, TIMESTAMP_TO_MS
         )
@@ -522,15 +669,22 @@ class RemoteBitrateEstimator:
         self.detector = OveruseDetector()
         self.rate_control = AimdRateControl()
         self.last_update_ms: Optional[int] = None
+        self.first_packet_time_ms: Optional[int] = None
+        self.probes: list[Probe] = []
+        self.total_probes_received = 0
         self.ssrcs: dict[int, int] = {}
 
     def add(
         self, arrival_time_ms: int, abs_send_time: int, payload_size: int, ssrc: int
     ) -> Optional[tuple[int, list[int]]]:
         timestamp = abs_send_time << 8
+        send_time_ms = int(timestamp * TIMESTAMP_TO_MS)
         update_estimate = False
 
-        # make note of SSRC
+        if self.first_packet_time_ms is None:
+            self.first_packet_time_ms = arrival_time_ms
+
+        self._timeout_streams(arrival_time_ms)
         self.ssrcs[ssrc] = arrival_time_ms
 
         # update incoming bitrate
@@ -541,9 +695,28 @@ class RemoteBitrateEstimator:
             self.incoming_bitrate_initialized = False
         self.incoming_bitrate.add(payload_size, arrival_time_ms)
 
+        if (
+            payload_size > MIN_PROBE_PACKET_SIZE
+            and (
+                not self.rate_control.valid_estimate()
+                or arrival_time_ms - self.first_packet_time_ms
+                < INITIAL_PROBING_INTERVAL_MS
+            )
+        ):
+            if self.total_probes_received < MAX_PROBE_PACKETS:
+                self.probes.append(
+                    Probe(
+                        send_time_ms=send_time_ms,
+                        recv_time_ms=arrival_time_ms,
+                        payload_size=payload_size,
+                    )
+                )
+                self.total_probes_received += 1
+                update_estimate = self._process_clusters(arrival_time_ms)
+
         # calculate inter-arrival deltas
         deltas = self.inter_arrival.compute_deltas(
-            timestamp, arrival_time_ms, payload_size
+            timestamp, arrival_time_ms, payload_size, arrival_time_ms
         )
         if deltas is not None:
             timestamp_delta_ms = deltas.timestamp * TIMESTAMP_TO_MS
@@ -569,7 +742,14 @@ class RemoteBitrateEstimator:
             ):
                 update_estimate = True
             elif self.detector.state() == BandwidthUsage.OVERUSING:
-                update_estimate = True
+                incoming_rate = self.incoming_bitrate.rate(arrival_time_ms)
+                if (
+                    incoming_rate is not None
+                    and self.rate_control.time_to_reduce_further(
+                        arrival_time_ms, incoming_rate
+                    )
+                ):
+                    update_estimate = True
 
         if update_estimate:
             target_bitrate = self.rate_control.update(
@@ -577,8 +757,122 @@ class RemoteBitrateEstimator:
                 self.incoming_bitrate.rate(arrival_time_ms),
                 arrival_time_ms,
             )
-            if target_bitrate is not None:
+            if target_bitrate is not None and self.rate_control.valid_estimate():
                 self.last_update_ms = arrival_time_ms
                 return target_bitrate, list(self.ssrcs.keys())
 
         return None
+
+    def _compute_clusters(self) -> list[ProbeCluster]:
+        clusters = []
+        aggregate = ProbeCluster()
+        prev_probe: Probe | None = None
+
+        for probe in self.probes:
+            if prev_probe is not None:
+                send_delta = probe.send_time_ms - prev_probe.send_time_ms
+                recv_delta = probe.recv_time_ms - prev_probe.recv_time_ms
+                if (
+                    send_delta >= MIN_CLUSTER_DELTA_MS
+                    and recv_delta >= MIN_CLUSTER_DELTA_MS
+                ):
+                    aggregate.num_above_min_delta += 1
+                if not self._is_within_cluster_bounds(send_delta, aggregate):
+                    self._maybe_add_cluster(aggregate, clusters)
+                    aggregate = ProbeCluster()
+                aggregate.send_mean_ms += send_delta
+                aggregate.recv_mean_ms += recv_delta
+                aggregate.mean_size += probe.payload_size
+                aggregate.count += 1
+            prev_probe = probe
+
+        self._maybe_add_cluster(aggregate, clusters)
+        return clusters
+
+    def _find_best_probe(self, clusters: list[ProbeCluster]) -> ProbeCluster | None:
+        best = None
+        highest_probe_bitrate = 0
+        for cluster in clusters:
+            if cluster.send_mean_ms <= 0 or cluster.recv_mean_ms <= 0:
+                continue
+            if (
+                cluster.num_above_min_delta > cluster.count / 2
+                and cluster.recv_mean_ms - cluster.send_mean_ms <= 2
+                and cluster.send_mean_ms - cluster.recv_mean_ms <= 5
+            ):
+                probe_bitrate = min(cluster.send_bitrate(), cluster.recv_bitrate())
+                if probe_bitrate > highest_probe_bitrate:
+                    highest_probe_bitrate = probe_bitrate
+                    best = cluster
+            else:
+                break
+        return best
+
+    def _is_bitrate_improving(self, probe_bitrate: int) -> bool:
+        if not self.rate_control.valid_estimate():
+            return probe_bitrate > 0
+        return probe_bitrate > self.rate_control.current_bitrate
+
+    def _is_within_cluster_bounds(
+        self, send_delta_ms: int, cluster: ProbeCluster
+    ) -> bool:
+        if cluster.count == 0:
+            return True
+        cluster_mean = cluster.send_mean_ms / cluster.count
+        return abs(send_delta_ms - cluster_mean) < 2.5
+
+    def _maybe_add_cluster(
+        self, aggregate: ProbeCluster, clusters: list[ProbeCluster]
+    ) -> None:
+        if (
+            aggregate.count < MIN_CLUSTER_SIZE
+            or aggregate.send_mean_ms <= 0
+            or aggregate.recv_mean_ms <= 0
+        ):
+            return
+
+        clusters.append(
+            ProbeCluster(
+                send_mean_ms=aggregate.send_mean_ms / aggregate.count,
+                recv_mean_ms=aggregate.recv_mean_ms / aggregate.count,
+                mean_size=aggregate.mean_size / aggregate.count,
+                count=aggregate.count,
+                num_above_min_delta=aggregate.num_above_min_delta,
+            )
+        )
+
+    def _process_clusters(self, now_ms: int) -> bool:
+        clusters = self._compute_clusters()
+        if not clusters:
+            if len(self.probes) >= MAX_PROBE_PACKETS:
+                self.probes.pop(0)
+            return False
+
+        best = self._find_best_probe(clusters)
+        if best is not None:
+            probe_bitrate = min(best.send_bitrate(), best.recv_bitrate())
+            if self._is_bitrate_improving(probe_bitrate):
+                self.rate_control.set_estimate(probe_bitrate, now_ms)
+                return True
+
+        if len(clusters) >= EXPECTED_NUMBER_OF_PROBES:
+            self.probes.clear()
+        return False
+
+    def _reset_inter_arrival(self) -> None:
+        self.inter_arrival = InterArrival(
+            (TIMESTAMP_GROUP_LENGTH_MS << INTER_ARRIVAL_SHIFT) // 1000, TIMESTAMP_TO_MS
+        )
+        self.estimator = OveruseEstimator()
+
+    def _timeout_streams(self, now_ms: int) -> None:
+        timed_out = [
+            ssrc
+            for ssrc, last_ms in self.ssrcs.items()
+            if now_ms - last_ms > STREAM_TIMEOUT_MS
+        ]
+        for ssrc in timed_out:
+            self.ssrcs.pop(ssrc, None)
+
+        if not self.ssrcs:
+            self._reset_inter_arrival()
