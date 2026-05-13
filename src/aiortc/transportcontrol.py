@@ -23,7 +23,7 @@ from pycc import (
 
 from . import clock
 from .rtcrtpparameters import RTCRtcpFeedback, RTCRtpHeaderExtensionParameters
-from .transporttrace import TransportCcTraceWriter
+from .transporttrace import NetTraceWriter
 
 RTCP_RTPFB = 205
 TRANSPORT_CC_HEADER_EXTENSION_ID = 5
@@ -136,7 +136,7 @@ class PyccTransportControlProvider:
     def __init__(
         self,
         constraints: RateConstraints | None = None,
-        trace_writer: TransportCcTraceWriter | None = None,
+        trace_writer: NetTraceWriter | None = None,
     ) -> None:
         self._transport_sequence_number = 0
         self._trace_writer = trace_writer
@@ -225,7 +225,14 @@ class PyccTransportControlProvider:
             arrival_time_us=arrival_time_us,
         )
         self._active = True
-        return self._twcc_recorder.build_feedback(arrival_time_us)
+        feedback_packets = self._twcc_recorder.build_feedback(arrival_time_us)
+        if self._trace_writer is not None:
+            for feedback in feedback_packets:
+                self._trace_writer.write_receiver_feedback(
+                    feedback=feedback,
+                    feedback_time_us=arrival_time_us,
+                )
+        return feedback_packets
 
     def handle_transport_feedback(
         self, feedback: TransportLayerCcPacket, feedback_time_us: int

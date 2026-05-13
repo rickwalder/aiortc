@@ -9,15 +9,12 @@ from typing import Any, TextIO
 
 logger = logging.getLogger(__name__)
 
-_TRACE_ENV = "AIORTC_TRANSPORT_CC_TRACE_JSONL"
+NET_TRACE_ENV = "AIORTC_NET_TRACE"
 
 
-class TransportCcTraceWriter:
+class NetTraceWriter:
     """
-    Append-only JSONL trace for send-side transport-cc diagnostics.
-
-    This is intentionally opt-in and compact. The records are meant for local
-    replay / analysis, not for user-facing logs.
+    Append-only JSONL trace for aiortc network diagnostics.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
@@ -33,14 +30,14 @@ class TransportCcTraceWriter:
         )
 
     @classmethod
-    def from_environment(cls) -> "TransportCcTraceWriter | None":
-        path = os.environ.get(_TRACE_ENV)
+    def from_environment(cls) -> "NetTraceWriter | None":
+        path = os.environ.get(NET_TRACE_ENV)
         if not path:
             return None
         try:
             return cls(path)
         except OSError:
-            logger.warning("could not open transport-cc trace file %s", path)
+            logger.warning("could not open aiortc network trace file %s", path)
             return None
 
     def close(self) -> None:
@@ -53,6 +50,10 @@ class TransportCcTraceWriter:
         pacing_info = getattr(packet, "pacing_info", None)
         self.write_event(
             "sent",
+            trace="transport-cc",
+            regime="twcc-gcc",
+            trace_role="sender",
+            direction="outbound-rtp",
             transport_sequence_number=packet.transport_sequence_number,
             send_time_us=packet.send_time_us,
             size_bytes=packet.size_bytes,
@@ -85,6 +86,10 @@ class TransportCcTraceWriter:
 
         self.write_event(
             "feedback",
+            trace="transport-cc",
+            regime="twcc-gcc",
+            trace_role="sender",
+            direction="inbound-rtcp",
             feedback_time_us=normalized.feedback_time_us,
             sender_ssrc=feedback.sender_ssrc,
             media_ssrc=feedback.media_ssrc,
@@ -92,6 +97,32 @@ class TransportCcTraceWriter:
             feedback_packet_count=feedback.feedback_packet_count,
             packet_status_count=len(feedback.packets),
             data_in_flight_bytes=normalized.data_in_flight_bytes,
+            packets=packets,
+        )
+
+    def write_receiver_feedback(
+        self, *, feedback: Any, feedback_time_us: int
+    ) -> None:
+        packets = [
+            [
+                packet.sequence_number,
+                packet.received,
+                packet.receive_delta_us,
+            ]
+            for packet in feedback.packets
+        ]
+        self.write_event(
+            "receiver-feedback",
+            trace="transport-cc",
+            regime="twcc-gcc",
+            trace_role="receiver",
+            direction="outbound-rtcp",
+            feedback_time_us=feedback_time_us,
+            sender_ssrc=feedback.sender_ssrc,
+            media_ssrc=feedback.media_ssrc,
+            base_sequence_number=feedback.base_sequence_number,
+            feedback_packet_count=feedback.feedback_packet_count,
+            packet_status_count=len(feedback.packets),
             packets=packets,
         )
 
@@ -104,6 +135,10 @@ class TransportCcTraceWriter:
     ) -> None:
         self.write_event(
             "target-update",
+            trace="transport-cc",
+            regime="twcc-gcc",
+            trace_role="sender",
+            direction="local-control",
             feedback_time_us=telemetry.last_feedback_time_us,
             target_bitrate_bps=update.target_bitrate_bps,
             stable_target_bitrate_bps=update.stable_target_bitrate_bps,
@@ -140,6 +175,10 @@ class TransportCcTraceWriter:
     def write_inter_arrival_sample(self, sample: Any) -> None:
         self.write_event(
             "inter-arrival",
+            trace="transport-cc",
+            regime="twcc-gcc",
+            trace_role="sender",
+            direction="local-estimator",
             feedback_time_us=sample.feedback_time_us,
             previous_first_send_time_us=sample.previous_first_send_time_us,
             previous_last_send_time_us=sample.previous_last_send_time_us,
@@ -165,8 +204,100 @@ class TransportCcTraceWriter:
             groups_seen=sample.groups_seen,
         )
 
+    def write_remb_observation(self, telemetry: Any) -> None:
+        self.write_event(
+            "observation",
+            trace="remb",
+            regime="remb",
+            trace_role="receiver",
+            direction="inbound-rtp",
+            arrival_time_ms=telemetry.arrival_time_ms,
+            send_time_ms=telemetry.send_time_ms,
+            abs_send_time=telemetry.abs_send_time,
+            payload_size=telemetry.payload_size,
+            ssrc=telemetry.ssrc,
+            active_ssrcs=list(telemetry.active_ssrcs),
+            incoming_bitrate_bps=telemetry.incoming_bitrate_bps,
+            target_bitrate_bps=telemetry.target_bitrate_bps,
+            valid_estimate=telemetry.valid_estimate,
+            detector_state=telemetry.detector_state,
+            aimd_state=telemetry.aimd_state,
+            estimator_offset_ms=telemetry.estimator_offset_ms,
+            estimator_slope=telemetry.estimator_slope,
+            estimator_num_deltas=telemetry.estimator_num_deltas,
+            detector_threshold_ms=telemetry.detector_threshold_ms,
+            detector_overuse_counter=telemetry.detector_overuse_counter,
+            detector_overuse_time_ms=telemetry.detector_overuse_time_ms,
+            timestamp_delta_ms=telemetry.timestamp_delta_ms,
+            arrival_time_delta_ms=telemetry.arrival_time_delta_ms,
+            size_delta=telemetry.size_delta,
+            probe_count=telemetry.probe_count,
+            total_probes_received=telemetry.total_probes_received,
+            last_probe_bitrate_bps=telemetry.last_probe_bitrate_bps,
+            stream_count=telemetry.stream_count,
+        )
+
+    def write_remb_feedback(
+        self, *, bitrate: int, ssrcs: list[int], telemetry: Any
+    ) -> None:
+        self.write_event(
+            "feedback",
+            trace="remb",
+            regime="remb",
+            trace_role="receiver",
+            direction="outbound-rtcp",
+            arrival_time_ms=telemetry.arrival_time_ms,
+            bitrate_bps=bitrate,
+            ssrcs=ssrcs,
+            reason=telemetry.update_reason,
+            incoming_bitrate_bps=telemetry.incoming_bitrate_bps,
+            detector_state=telemetry.detector_state,
+            aimd_state=telemetry.aimd_state,
+            estimator_offset_ms=telemetry.estimator_offset_ms,
+            estimator_num_deltas=telemetry.estimator_num_deltas,
+            detector_threshold_ms=telemetry.detector_threshold_ms,
+            detector_overuse_counter=telemetry.detector_overuse_counter,
+            detector_overuse_time_ms=telemetry.detector_overuse_time_ms,
+            timestamp_delta_ms=telemetry.timestamp_delta_ms,
+            arrival_time_delta_ms=telemetry.arrival_time_delta_ms,
+            size_delta=telemetry.size_delta,
+            probe_count=telemetry.probe_count,
+            total_probes_received=telemetry.total_probes_received,
+            last_probe_bitrate_bps=telemetry.last_probe_bitrate_bps,
+            active_ssrcs=list(telemetry.active_ssrcs),
+        )
+
+    def write_remb_receiver_estimate(
+        self,
+        *,
+        bitrate: int,
+        ssrcs: list[int],
+        now_ms: int,
+        accepted: bool,
+        reason: str,
+        sender_count: int,
+    ) -> None:
+        self.write_event(
+            "receiver-estimate",
+            trace="remb",
+            regime="remb",
+            trace_role="sender",
+            direction="inbound-rtcp",
+            now_ms=now_ms,
+            bitrate_bps=bitrate,
+            ssrcs=ssrcs,
+            accepted=accepted,
+            reason=reason,
+            sender_count=sender_count,
+        )
+
     def write_event(self, event_type: str, **payload: Any) -> None:
         if self._closed:
             return
         payload["type"] = event_type
+        payload.setdefault("schema_version", 1)
+        payload.setdefault("trace", "unknown")
+        payload.setdefault("regime", "unknown")
+        payload.setdefault("trace_role", "unknown")
+        payload.setdefault("direction", "unknown")
         self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")

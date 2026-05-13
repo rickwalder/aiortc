@@ -18,7 +18,7 @@ from aiortc.transportcontrol import (
     get_transport_control_capabilities,
     is_transport_control_enabled,
 )
-from aiortc.transporttrace import TransportCcTraceWriter
+from aiortc.transporttrace import NetTraceWriter
 from pycc import RTPFB_TRANSPORT_CC_FMT, TRANSPORT_CC_URI
 from pycc.types import PacerConfig, ProbeClusterConfig
 
@@ -315,7 +315,7 @@ class AsyncRtpPacerTest(TestCase):
 
     def test_trace_writer_records_sent_and_feedback(self) -> None:
         with tempfile.NamedTemporaryFile() as fp:
-            trace_writer = TransportCcTraceWriter(fp.name)
+            trace_writer = NetTraceWriter(fp.name)
             provider = PyccTransportControlProvider(trace_writer=trace_writer)
             sequence_number = provider.next_transport_sequence_number()
             provider.on_packet_sent(
@@ -344,12 +344,22 @@ class AsyncRtpPacerTest(TestCase):
             ]
 
         self.assertEqual(records[0]["type"], "trace-start")
+        self.assertEqual(records[0]["trace"], "unknown")
+        self.assertEqual(records[0]["regime"], "unknown")
         self.assertEqual(records[1]["type"], "sent")
+        self.assertEqual(records[1]["trace_role"], "sender")
+        self.assertEqual(records[1]["direction"], "outbound-rtp")
         self.assertEqual(records[1]["transport_sequence_number"], sequence_number)
         self.assertEqual(records[1]["payload_size_bytes"], 900)
-        self.assertEqual(records[2]["type"], "feedback")
+        self.assertEqual(records[2]["type"], "receiver-feedback")
+        self.assertEqual(records[2]["trace_role"], "receiver")
+        self.assertEqual(records[2]["direction"], "outbound-rtcp")
         self.assertEqual(records[2]["base_sequence_number"], sequence_number)
-        self.assertEqual(records[2]["packets"][0][0], sequence_number)
+        self.assertEqual(records[3]["type"], "feedback")
+        self.assertEqual(records[3]["trace_role"], "sender")
+        self.assertEqual(records[3]["direction"], "inbound-rtcp")
+        self.assertEqual(records[3]["base_sequence_number"], sequence_number)
+        self.assertEqual(records[3]["packets"][0][0], sequence_number)
 
 
 class TransportCongestionControllerTest(TestCase):
@@ -453,6 +463,74 @@ class TransportCongestionControllerTest(TestCase):
             [],
         )
         estimator.add.assert_not_called()
+
+    def test_incoming_remb_writes_separate_trace(self) -> None:
+        with tempfile.NamedTemporaryFile() as fp:
+            with patch.dict(os.environ, {"AIORTC_NET_TRACE": fp.name}):
+                controller = TransportCongestionController()
+            receiver = DummyReceiver()
+            controller.register_receiver(receiver)
+            estimator = (
+                controller._TransportCongestionController__remote_bitrate_estimator
+            )
+            estimator.add = Mock(return_value=(1_000_000, [1234]))
+
+            packet = RtpPacket(
+                payload_type=96,
+                sequence_number=1,
+                timestamp=2,
+                ssrc=1234,
+            )
+            packet.extensions.abs_send_time = 123
+
+            feedback = controller.observe_incoming_rtp(receiver, packet, 100)
+            self.assertEqual(len(feedback), 1)
+            controller._TransportCongestionController__net_trace_writer.close()
+
+            fp.file.seek(0)
+            records = [
+                json.loads(line)
+                for line in fp.file.read().decode("utf-8").splitlines()
+            ]
+
+        self.assertEqual(records[0]["type"], "trace-start")
+        self.assertEqual(records[0]["trace"], "unknown")
+        self.assertEqual(records[0]["regime"], "unknown")
+        self.assertEqual(records[1]["type"], "observation")
+        self.assertEqual(records[1]["trace_role"], "receiver")
+        self.assertEqual(records[1]["direction"], "inbound-rtp")
+        self.assertEqual(records[2]["type"], "feedback")
+        self.assertEqual(records[2]["trace_role"], "receiver")
+        self.assertEqual(records[2]["direction"], "outbound-rtcp")
+        self.assertEqual(records[2]["bitrate_bps"], 1_000_000)
+        self.assertEqual(records[2]["ssrcs"], [1234])
+
+    def test_incoming_remb_receiver_estimate_writes_sender_trace(self) -> None:
+        with tempfile.NamedTemporaryFile() as fp:
+            with patch.dict(os.environ, {"AIORTC_NET_TRACE": fp.name}):
+                controller = TransportCongestionController()
+            controller.register_sender(DummySender(ssrc=1234))
+
+            controller.update_receiver_estimate(
+                bitrate=1_000_000,
+                ssrcs=[1234],
+                now_ms=100,
+            )
+            controller._TransportCongestionController__net_trace_writer.close()
+
+            fp.file.seek(0)
+            records = [
+                json.loads(line)
+                for line in fp.file.read().decode("utf-8").splitlines()
+            ]
+
+        self.assertEqual(records[0]["type"], "trace-start")
+        self.assertEqual(records[1]["type"], "receiver-estimate")
+        self.assertEqual(records[1]["trace_role"], "sender")
+        self.assertEqual(records[1]["direction"], "inbound-rtcp")
+        self.assertEqual(records[1]["accepted"], True)
+        self.assertEqual(records[1]["reason"], "accepted")
+        self.assertEqual(records[1]["bitrate_bps"], 1_000_000)
 
     def test_get_pacer_config_delegates_to_provider(self) -> None:
         controller = TransportCongestionController()

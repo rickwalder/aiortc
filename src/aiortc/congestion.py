@@ -22,7 +22,7 @@ from .transportcontrol import (
     PyccTransportControlProvider,
     TransportControlSentPacket,
 )
-from .transporttrace import TransportCcTraceWriter
+from .transporttrace import NetTraceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +131,9 @@ class TransportCongestionController:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__remote_bitrate_estimator = RemoteBitrateEstimator()
         self.__session_target_bitrate: Optional[int] = None
-        self.__trace_writer = TransportCcTraceWriter.from_environment()
+        self.__net_trace_writer = NetTraceWriter.from_environment()
         self.__transport_control = PyccTransportControlProvider(
-            trace_writer=self.__trace_writer
+            trace_writer=self.__net_trace_writer
         )
         self.__rtp_pacer = AsyncRtpPacer()
         self.__retransmission_rate_limiter = _RateLimiter(
@@ -175,9 +175,37 @@ class TransportCongestionController:
         self, bitrate: int, ssrcs: list[int], now_ms: int
     ) -> None:
         if self.__transport_control.active:
+            if self.__net_trace_writer is not None:
+                self.__net_trace_writer.write_remb_receiver_estimate(
+                    bitrate=bitrate,
+                    ssrcs=ssrcs,
+                    now_ms=now_ms,
+                    accepted=False,
+                    reason="transport-cc-active",
+                    sender_count=len(self.__senders),
+                )
             return
         if not self.__senders:
+            if self.__net_trace_writer is not None:
+                self.__net_trace_writer.write_remb_receiver_estimate(
+                    bitrate=bitrate,
+                    ssrcs=ssrcs,
+                    now_ms=now_ms,
+                    accepted=False,
+                    reason="no-senders",
+                    sender_count=0,
+                )
             return
+
+        if self.__net_trace_writer is not None:
+            self.__net_trace_writer.write_remb_receiver_estimate(
+                bitrate=bitrate,
+                ssrcs=ssrcs,
+                now_ms=now_ms,
+                accepted=True,
+                reason="accepted",
+                sender_count=len(self.__senders),
+            )
 
         for ssrc in ssrcs:
             if ssrc in self.__senders:
@@ -314,6 +342,9 @@ class TransportCongestionController:
             payload_size=len(packet.payload) + packet.padding_size,
             ssrc=packet.ssrc,
         )
+        remb_telemetry = self.__remote_bitrate_estimator.get_telemetry()
+        if self.__net_trace_writer is not None:
+            self.__net_trace_writer.write_remb_observation(remb_telemetry)
         if remb is None:
             return feedback
 
@@ -322,6 +353,10 @@ class TransportCongestionController:
             return feedback
 
         bitrate, ssrcs = remb
+        if self.__net_trace_writer is not None:
+            self.__net_trace_writer.write_remb_feedback(
+                bitrate=bitrate, ssrcs=ssrcs, telemetry=remb_telemetry
+            )
 
         feedback.append(
             RtcpPsfbPacket(
@@ -526,9 +561,9 @@ class TransportCongestionController:
         self.__last_logged_target_bitrate = update.target_bitrate_bps
 
     def __trace_target_update(self, previous_target, update) -> None:
-        if self.__trace_writer is None:
+        if self.__net_trace_writer is None:
             return
-        self.__trace_writer.write_target_update(
+        self.__net_trace_writer.write_target_update(
             previous_target=previous_target,
             update=update,
             telemetry=self.__transport_control.get_telemetry(),

@@ -658,6 +658,35 @@ class ProbeCluster:
         return round(self.mean_size * 8 * 1000 / self.recv_mean_ms)
 
 
+@dataclass(frozen=True)
+class RemoteBitrateTelemetry:
+    arrival_time_ms: int = 0
+    send_time_ms: int = 0
+    abs_send_time: int = 0
+    payload_size: int = 0
+    ssrc: int = 0
+    active_ssrcs: tuple[int, ...] = ()
+    incoming_bitrate_bps: int = 0
+    target_bitrate_bps: int = 0
+    valid_estimate: bool = False
+    update_reason: str = ""
+    detector_state: str = "normal"
+    aimd_state: str = "hold"
+    estimator_offset_ms: float = 0.0
+    estimator_slope: float = 0.0
+    estimator_num_deltas: int = 0
+    detector_threshold_ms: float = 0.0
+    detector_overuse_counter: int = 0
+    detector_overuse_time_ms: float = 0.0
+    timestamp_delta_ms: float = 0.0
+    arrival_time_delta_ms: int = 0
+    size_delta: int = 0
+    probe_count: int = 0
+    total_probes_received: int = 0
+    last_probe_bitrate_bps: int = 0
+    stream_count: int = 0
+
+
 class RemoteBitrateEstimator:
     def __init__(self) -> None:
         self.incoming_bitrate = RateCounter(1000, 8000)
@@ -672,6 +701,8 @@ class RemoteBitrateEstimator:
         self.first_packet_time_ms: Optional[int] = None
         self.probes: list[Probe] = []
         self.total_probes_received = 0
+        self.last_probe_bitrate_bps = 0
+        self._last_telemetry = RemoteBitrateTelemetry()
         self.ssrcs: dict[int, int] = {}
 
     def add(
@@ -680,6 +711,10 @@ class RemoteBitrateEstimator:
         timestamp = abs_send_time << 8
         send_time_ms = int(timestamp * TIMESTAMP_TO_MS)
         update_estimate = False
+        update_reason = ""
+        timestamp_delta_ms = 0.0
+        arrival_time_delta_ms = 0
+        size_delta = 0
 
         if self.first_packet_time_ms is None:
             self.first_packet_time_ms = arrival_time_ms
@@ -713,6 +748,8 @@ class RemoteBitrateEstimator:
                 )
                 self.total_probes_received += 1
                 update_estimate = self._process_clusters(arrival_time_ms)
+                if update_estimate:
+                    update_reason = "probe"
 
         # calculate inter-arrival deltas
         deltas = self.inter_arrival.compute_deltas(
@@ -720,6 +757,8 @@ class RemoteBitrateEstimator:
         )
         if deltas is not None:
             timestamp_delta_ms = deltas.timestamp * TIMESTAMP_TO_MS
+            arrival_time_delta_ms = deltas.arrival_time
+            size_delta = deltas.size
             self.estimator.update(
                 deltas.arrival_time,
                 timestamp_delta_ms,
@@ -741,6 +780,7 @@ class RemoteBitrateEstimator:
                 > self.rate_control.feedback_interval()
             ):
                 update_estimate = True
+                update_reason = "periodic"
             elif self.detector.state() == BandwidthUsage.OVERUSING:
                 incoming_rate = self.incoming_bitrate.rate(arrival_time_ms)
                 if (
@@ -750,7 +790,9 @@ class RemoteBitrateEstimator:
                     )
                 ):
                     update_estimate = True
+                    update_reason = "overuse"
 
+        target_bitrate = None
         if update_estimate:
             target_bitrate = self.rate_control.update(
                 self.detector.state(),
@@ -759,8 +801,32 @@ class RemoteBitrateEstimator:
             )
             if target_bitrate is not None and self.rate_control.valid_estimate():
                 self.last_update_ms = arrival_time_ms
+                self._last_telemetry = self._build_telemetry(
+                    arrival_time_ms=arrival_time_ms,
+                    send_time_ms=send_time_ms,
+                    abs_send_time=abs_send_time,
+                    payload_size=payload_size,
+                    ssrc=ssrc,
+                    update_reason=update_reason,
+                    target_bitrate=target_bitrate,
+                    timestamp_delta_ms=timestamp_delta_ms,
+                    arrival_time_delta_ms=arrival_time_delta_ms,
+                    size_delta=size_delta,
+                )
                 return target_bitrate, list(self.ssrcs.keys())
 
+        self._last_telemetry = self._build_telemetry(
+            arrival_time_ms=arrival_time_ms,
+            send_time_ms=send_time_ms,
+            abs_send_time=abs_send_time,
+            payload_size=payload_size,
+            ssrc=ssrc,
+            update_reason="",
+            target_bitrate=target_bitrate,
+            timestamp_delta_ms=timestamp_delta_ms,
+            arrival_time_delta_ms=arrival_time_delta_ms,
+            size_delta=size_delta,
+        )
         return None
 
     def _compute_clusters(self) -> list[ProbeCluster]:
@@ -852,6 +918,7 @@ class RemoteBitrateEstimator:
         if best is not None:
             probe_bitrate = min(best.send_bitrate(), best.recv_bitrate())
             if self._is_bitrate_improving(probe_bitrate):
+                self.last_probe_bitrate_bps = probe_bitrate
                 self.rate_control.set_estimate(probe_bitrate, now_ms)
                 return True
 
@@ -876,3 +943,58 @@ class RemoteBitrateEstimator:
 
         if not self.ssrcs:
             self._reset_inter_arrival()
+
+    def _build_telemetry(
+        self,
+        *,
+        arrival_time_ms: int,
+        send_time_ms: int,
+        abs_send_time: int,
+        payload_size: int,
+        ssrc: int,
+        update_reason: str,
+        target_bitrate: int | None,
+        timestamp_delta_ms: float,
+        arrival_time_delta_ms: int,
+        size_delta: int,
+    ) -> RemoteBitrateTelemetry:
+        incoming_rate = self.incoming_bitrate.rate(arrival_time_ms) or 0
+        overuse_time = (
+            self.detector.overuse_time
+            if self.detector.overuse_time is not None
+            else -1
+        )
+        return RemoteBitrateTelemetry(
+            arrival_time_ms=arrival_time_ms,
+            send_time_ms=send_time_ms,
+            abs_send_time=abs_send_time,
+            payload_size=payload_size,
+            ssrc=ssrc,
+            active_ssrcs=tuple(self.ssrcs.keys()),
+            incoming_bitrate_bps=incoming_rate,
+            target_bitrate_bps=(
+                target_bitrate
+                if target_bitrate is not None
+                else self.rate_control.current_bitrate
+            ),
+            valid_estimate=self.rate_control.valid_estimate(),
+            update_reason=update_reason,
+            detector_state=self.detector.state().name.lower(),
+            aimd_state=self.rate_control.state.name.lower(),
+            estimator_offset_ms=self.estimator.offset(),
+            estimator_slope=self.estimator.slope,
+            estimator_num_deltas=self.estimator.num_of_deltas(),
+            detector_threshold_ms=self.detector.threshold,
+            detector_overuse_counter=self.detector.overuse_counter,
+            detector_overuse_time_ms=overuse_time,
+            timestamp_delta_ms=timestamp_delta_ms,
+            arrival_time_delta_ms=arrival_time_delta_ms,
+            size_delta=size_delta,
+            probe_count=len(self.probes),
+            total_probes_received=self.total_probes_received,
+            last_probe_bitrate_bps=self.last_probe_bitrate_bps,
+            stream_count=len(self.ssrcs),
+        )
+
+    def get_telemetry(self) -> RemoteBitrateTelemetry:
+        return self._last_telemetry
