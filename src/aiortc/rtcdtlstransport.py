@@ -5,6 +5,7 @@ import enum
 import logging
 import os
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, Type, TypeVar, Union
 
@@ -255,6 +256,16 @@ class RtpSender(Protocol):
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
 
 
+@dataclass
+class _QueuedRtpPacket:
+    packet: RtpPacket
+    extensions_map: rtp.HeaderExtensionsMap
+    size_bytes: int
+    payload_size_bytes: int
+    is_retransmission: bool
+    enqueued_time_us: int
+
+
 class RtpRouter:
     """
     Router to associate RTP/RTCP packets with streams.
@@ -376,8 +387,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_header_extensions_map = rtp.HeaderExtensionsMap()
         self._rtp_router = RtpRouter()
         self._rtp_send_lock = asyncio.Lock()
+        self._rtp_queue: deque[_QueuedRtpPacket] = deque()
+        self._rtp_queue_bytes = 0
+        self._rtp_queue_event = asyncio.Event()
         self._congestion_controller = TransportCongestionController()
-        self._rtp_probe_padding_task: Optional[asyncio.Future[None]] = None
+        self._rtp_pacer_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
         self._task: Optional[asyncio.Future[None]] = None
@@ -562,9 +576,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self.__log_debug("- DTLS handshake complete")
         self._set_state(State.CONNECTED)
         self._task = asyncio.ensure_future(self.__run())
-        self._rtp_probe_padding_task = asyncio.ensure_future(
-            self.__run_rtp_probe_padding()
-        )
+        self._rtp_pacer_task = asyncio.ensure_future(self.__run_rtp_pacer())
 
     async def stop(self) -> None:
         """
@@ -573,9 +585,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         if self._task is not None:
             self._task.cancel()
             self._task = None
-        if self._rtp_probe_padding_task is not None:
-            self._rtp_probe_padding_task.cancel()
-            self._rtp_probe_padding_task = None
+        if self._rtp_pacer_task is not None:
+            self._rtp_pacer_task.cancel()
+            self._rtp_pacer_task = None
 
         if self._ssl and self._state in [State.CONNECTING, State.CONNECTED]:
             try:
@@ -771,27 +783,20 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         payload_size_bytes: int = 0,
         is_retransmission: bool = False,
     ) -> None:
-        async with self._rtp_send_lock:
-            if is_video and extensions_map.has_transport_sequence_number:
-                packet.extensions.transport_sequence_number = (
-                    self._congestion_controller.next_transport_sequence_number()
-                )
+        if is_video:
+            await self._enqueue_rtp_packet(
+                packet,
+                extensions_map,
+                payload_size_bytes=payload_size_bytes,
+                is_retransmission=is_retransmission,
+            )
+            return
 
+        async with self._rtp_send_lock:
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
-            pacing_info = None
-
-            if is_video:
-                pacing_info = await self._congestion_controller.pace_rtp_packet(
-                    size_bytes=len(packet_bytes),
-                )
-                packet.extensions.abs_send_time = (
-                    clock.current_ntp_time() >> 14
-                ) & 0x00FFFFFF
-                packet_bytes = packet.serialize(extensions_map)
-
             await self._send_rtp(packet_bytes)
 
             transport_sequence_number = packet.extensions.transport_sequence_number
@@ -804,24 +809,119 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                     ssrc=packet.ssrc,
                     rtp_sequence_number=packet.sequence_number,
                     is_retransmission=is_retransmission,
+                )
+
+    async def _enqueue_rtp_packet(
+        self,
+        packet: RtpPacket,
+        extensions_map: rtp.HeaderExtensionsMap,
+        *,
+        payload_size_bytes: int = 0,
+        is_retransmission: bool = False,
+    ) -> None:
+        async with self._rtp_send_lock:
+            if extensions_map.has_transport_sequence_number:
+                packet.extensions.transport_sequence_number = (
+                    self._congestion_controller.next_transport_sequence_number()
+                )
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            packet_bytes = packet.serialize(extensions_map)
+            queued = _QueuedRtpPacket(
+                packet=packet,
+                extensions_map=extensions_map,
+                size_bytes=len(packet_bytes),
+                payload_size_bytes=payload_size_bytes,
+                is_retransmission=is_retransmission,
+                enqueued_time_us=clock.current_monotonic_us(),
+            )
+            self._rtp_queue.append(queued)
+            self._rtp_queue_bytes += queued.size_bytes
+            self._update_rtp_queue_state()
+            self._rtp_queue_event.set()
+
+    async def _send_next_rtp_packet_from_queue(self) -> bool:
+        if not self._rtp_queue:
+            return False
+
+        queued = self._rtp_queue[0]
+        pacing_info = await self._congestion_controller.pace_rtp_packet(
+            size_bytes=queued.size_bytes,
+        )
+        async with self._rtp_send_lock:
+            if not self._rtp_queue or self._rtp_queue[0] is not queued:
+                return False
+
+            self._rtp_queue.popleft()
+            self._rtp_queue_bytes -= queued.size_bytes
+            self._update_rtp_queue_state()
+
+            packet = queued.packet
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            packet_bytes = packet.serialize(queued.extensions_map)
+            await self._send_rtp(packet_bytes)
+
+            transport_sequence_number = packet.extensions.transport_sequence_number
+            if transport_sequence_number is not None:
+                self._congestion_controller.on_packet_sent(
+                    transport_sequence_number=transport_sequence_number,
+                    send_time_us=clock.current_monotonic_us(),
+                    size_bytes=len(packet_bytes),
+                    payload_size_bytes=queued.payload_size_bytes,
+                    ssrc=packet.ssrc,
+                    rtp_sequence_number=packet.sequence_number,
+                    is_retransmission=queued.is_retransmission,
                     pacing_info=pacing_info,
                 )
+            return True
+
+    def _update_rtp_queue_state(self) -> None:
+        if self._rtp_queue:
+            oldest_age_ms = max(
+                0,
+                int(
+                    (
+                        clock.current_monotonic_us()
+                        - self._rtp_queue[0].enqueued_time_us
+                    )
+                    / 1000
+                ),
+            )
+        else:
+            oldest_age_ms = 0
+        self._congestion_controller.update_pacing_queue(
+            self._rtp_queue_bytes,
+            oldest_queue_age_ms=oldest_age_ms,
+        )
 
     def _set_role(self, role: str) -> None:
         self._role = role
 
-    async def __run_rtp_probe_padding(self) -> None:
+    async def __run_rtp_pacer(self) -> None:
         try:
             while True:
-                if not self._congestion_controller.has_probe_pending():
-                    await asyncio.sleep(0.01)
-                    continue
+                if self._rtp_queue:
+                    sent = await self._send_next_rtp_packet_from_queue()
+                    if sent:
+                        await asyncio.sleep(0)
+                        continue
 
-                sent = await self._send_rtp_probe_padding_packet()
-                if not sent:
-                    await asyncio.sleep(0.02)
-                else:
-                    await asyncio.sleep(0)
+                if self._congestion_controller.has_probe_pending():
+                    sent = await self._send_rtp_probe_padding_packet()
+                    if sent:
+                        await asyncio.sleep(0)
+                        continue
+
+                self._rtp_queue_event.clear()
+                if self._rtp_queue or self._congestion_controller.has_probe_pending():
+                    continue
+                try:
+                    await asyncio.wait_for(self._rtp_queue_event.wait(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    pass
         except (asyncio.CancelledError, ConnectionError):
             pass
         except Exception:
@@ -842,12 +942,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             if sender is None:
                 return False
 
-            pacing_info = await self._congestion_controller.pace_rtp_packet(
-                size_bytes=320,
-            )
-            if not pacing_info.is_probe:
-                return False
-
             padding_packet = sender._create_rtp_padding_packet(255)
             if padding_packet is None:
                 return False
@@ -863,6 +957,17 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
 
+        pacing_info = await self._congestion_controller.pace_rtp_packet(
+            size_bytes=len(packet_bytes),
+        )
+        if not pacing_info.is_probe:
+            return False
+
+        async with self._rtp_send_lock:
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            packet_bytes = packet.serialize(extensions_map)
             await self._send_rtp(packet_bytes)
 
             transport_sequence_number = packet.extensions.transport_sequence_number

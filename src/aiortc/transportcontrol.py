@@ -8,6 +8,7 @@ from pycc import (
     RTPFB_TRANSPORT_CC_FMT,
     TRANSPORT_CC_URI,
     GoogCcController,
+    InterArrivalSample,
     LeakyBucketPacerModel,
     PacedPacketInfo,
     PacerConfig,
@@ -60,6 +61,8 @@ class TransportControlTelemetry:
     lost_bytes: int = 0
     prior_unacked_bytes: int = 0
     data_in_flight_bytes: int = 0
+    pacing_queue_bytes: int = 0
+    pacing_queue_oldest_age_ms: int = 0
     oldest_in_flight_age_ms: int = 0
     packet_history_size: int = 0
     next_transport_sequence_number: int = 0
@@ -126,8 +129,11 @@ class PyccTransportControlProvider:
         trace_writer: TransportCcTraceWriter | None = None,
     ) -> None:
         self._transport_sequence_number = 0
-        self._gcc = GoogCcController(constraints)
         self._trace_writer = trace_writer
+        self._gcc = GoogCcController(
+            constraints,
+            trace_observer=self._write_inter_arrival_sample,
+        )
         self._twcc_recorder: Optional[TwccRecorder] = None
         self._twcc_feedback_ssrc: Optional[int] = None
         self._active = False
@@ -142,6 +148,8 @@ class PyccTransportControlProvider:
         self._acknowledged_bytes = 0
         self._lost_bytes = 0
         self._prior_unacked_bytes = 0
+        self._pacing_queue_bytes = 0
+        self._pacing_queue_oldest_age_ms = 0
         self._last_feedback_time_us = 0
         self._last_feedback_base_sequence_number = 0
         self._last_feedback_packet_count = 0
@@ -254,6 +262,17 @@ class PyccTransportControlProvider:
     def get_target_bitrate(self) -> int:
         return self._gcc.get_target_bitrate()
 
+    def update_pacing_queue(
+        self, queue_bytes: int, oldest_queue_age_ms: int = 0
+    ) -> None:
+        self._pacing_queue_bytes = max(0, queue_bytes)
+        self._pacing_queue_oldest_age_ms = max(0, oldest_queue_age_ms)
+        self._gcc.update_pacing_queue(self._pacing_queue_bytes)
+
+    def _write_inter_arrival_sample(self, sample: InterArrivalSample) -> None:
+        if self._trace_writer is not None:
+            self._trace_writer.write_inter_arrival_sample(sample)
+
     def get_telemetry(self) -> TransportControlTelemetry:
         update = self._last_update
         packet_history = self._gcc.packet_history
@@ -285,6 +304,8 @@ class PyccTransportControlProvider:
             lost_bytes=self._lost_bytes,
             prior_unacked_bytes=self._prior_unacked_bytes,
             data_in_flight_bytes=packet_history.data_in_flight_bytes,
+            pacing_queue_bytes=self._pacing_queue_bytes,
+            pacing_queue_oldest_age_ms=self._pacing_queue_oldest_age_ms,
             oldest_in_flight_age_ms=oldest_in_flight_age_ms,
             packet_history_size=packet_history.history_size,
             next_transport_sequence_number=self._transport_sequence_number,

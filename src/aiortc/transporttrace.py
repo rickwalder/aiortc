@@ -125,6 +125,8 @@ class TransportCcTraceWriter:
             delay_delta_ms=telemetry.last_delay_delta_ms,
             group_bytes=telemetry.last_group_bytes,
             data_in_flight_bytes=telemetry.data_in_flight_bytes,
+            pacing_queue_bytes=telemetry.pacing_queue_bytes,
+            pacing_queue_oldest_age_ms=telemetry.pacing_queue_oldest_age_ms,
             congestion_window_bytes=telemetry.congestion_window_bytes,
             congestion_window_fill_ratio=telemetry.congestion_window_fill_ratio,
             in_alr=telemetry.in_alr,
@@ -133,6 +135,34 @@ class TransportCcTraceWriter:
             probe_cluster_id=telemetry.probe_cluster_id,
             probe_target_bitrate_bps=telemetry.probe_target_bitrate_bps,
             last_probe_bitrate_bps=telemetry.last_probe_bitrate_bps,
+        )
+
+    def write_inter_arrival_sample(self, sample: Any) -> None:
+        self.write_event(
+            "inter-arrival",
+            feedback_time_us=sample.feedback_time_us,
+            previous_first_send_time_us=sample.previous_first_send_time_us,
+            previous_last_send_time_us=sample.previous_last_send_time_us,
+            previous_first_receive_time_us=sample.previous_first_receive_time_us,
+            previous_last_receive_time_us=sample.previous_last_receive_time_us,
+            current_first_send_time_us=sample.current_first_send_time_us,
+            current_last_send_time_us=sample.current_last_send_time_us,
+            current_first_receive_time_us=sample.current_first_receive_time_us,
+            current_last_receive_time_us=sample.current_last_receive_time_us,
+            group_bytes=sample.group_bytes,
+            send_delta_us=sample.send_delta_us,
+            receive_delta_us=sample.receive_delta_us,
+            delay_delta_ms=sample.delay_delta_ms,
+            trend_ms=sample.trend_ms,
+            raw_trend=sample.raw_trend,
+            threshold_ms=sample.threshold_ms,
+            accumulated_delay_ms=sample.accumulated_delay_ms,
+            smoothed_delay_ms=sample.smoothed_delay_ms,
+            trend_window_ms=sample.trend_window_ms,
+            overuse_counter=sample.overuse_counter,
+            overuse_time_us=sample.overuse_time_us,
+            delay_usage=sample.delay_usage,
+            groups_seen=sample.groups_seen,
         )
 
     def write_event(self, event_type: str, **payload: Any) -> None:

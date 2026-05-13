@@ -341,6 +341,10 @@ class RTCDtlsTransportTest(TestCase):
             payload_size_bytes=len(packet2.payload),
         )
 
+        self.assertEqual(len(sent_packets), 0)
+        self.assertTrue(await session._send_next_rtp_packet_from_queue())
+        self.assertTrue(await session._send_next_rtp_packet_from_queue())
+
         self.assertEqual(
             [packet.extensions.transport_sequence_number for packet in sent_packets],
             [0, 1],

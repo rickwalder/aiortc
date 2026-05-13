@@ -191,6 +191,14 @@ class TransportCongestionController:
     def get_pacer_config(self):
         return self.__transport_control.get_pacer_config()
 
+    def update_pacing_queue(
+        self, queue_bytes: int, oldest_queue_age_ms: int = 0
+    ) -> None:
+        self.__transport_control.update_pacing_queue(
+            queue_bytes,
+            oldest_queue_age_ms=oldest_queue_age_ms,
+        )
+
     def has_probe_pending(self) -> bool:
         config = self.__transport_control.get_pacer_config()
         return self.__rtp_pacer.is_probe_pending(config)
@@ -598,7 +606,8 @@ class TransportCongestionController:
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
             "encoded_observed_bps=%d sent_bps=%d acked_bps=%d lost_bps=%d "
             "prior_unacked_bps=%d sent_fill=%.2f acked_fill=%.2f "
-            "in_flight=%d oldest_in_flight_ms=%d history=%d "
+            "in_flight=%d pacing_queue=%d pacing_queue_ms=%d "
+            "oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
             "acked_estimate_bps=%d in_alr=%s alr_budget=%.2f "
             "pre_pushback_bps=%d pushback_bps=%d cwnd=%d cwnd_fill=%.2f "
@@ -631,6 +640,8 @@ class TransportCongestionController:
             sent_fill_ratio,
             acked_fill_ratio,
             telemetry.data_in_flight_bytes,
+            telemetry.pacing_queue_bytes,
+            telemetry.pacing_queue_oldest_age_ms,
             telemetry.oldest_in_flight_age_ms,
             telemetry.packet_history_size,
             telemetry.next_transport_sequence_number,

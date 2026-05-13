@@ -119,6 +119,13 @@ class PyccTransportControlProviderTest(TestCase):
 
         self.assertEqual(provider.get_target_bitrate(), 7_500_000)
 
+    def test_update_pacing_queue_is_reflected_in_telemetry(self) -> None:
+        provider = PyccTransportControlProvider()
+
+        provider.update_pacing_queue(12345)
+
+        self.assertEqual(provider.get_telemetry().pacing_queue_bytes, 12345)
+
 
 class AsyncRtpPacerTest(TestCase):
     @asynctest
