@@ -197,6 +197,32 @@ class AsyncRtpPacerTest(TestCase):
         self.assertFalse(third.is_probe)
 
     @asynctest
+    async def test_pace_honors_probe_cluster_min_delta(self) -> None:
+        pacer = AsyncRtpPacer()
+        sleeps = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        config = PacerConfig(
+            send_bitrate_bps=10_000_000,
+            window_us=40_000,
+            probe_cluster=ProbeClusterConfig(
+                id=10,
+                target_bitrate_bps=10_000_000,
+                target_duration_us=2_000,
+                min_probe_delta_us=2_000,
+                target_probe_count=2,
+            ),
+        )
+
+        with patch("aiortc.transportcontrol.asyncio.sleep", new=fake_sleep):
+            await pacer.pace(size_bytes=500, config=config, now_ms=0)
+            await pacer.pace(size_bytes=500, config=config, now_ms=0)
+
+        self.assertEqual(sleeps, [0.002])
+
+    @asynctest
     async def test_pacer_reports_pending_probe_until_cluster_minimum(self) -> None:
         pacer = AsyncRtpPacer()
         config = PacerConfig(

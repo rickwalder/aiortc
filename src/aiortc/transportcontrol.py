@@ -360,6 +360,7 @@ class AsyncRtpPacer:
         self._completed_probe_cluster_ids: set[int] = set()
         self._probe_sent_bytes = 0
         self._probe_sent_packets = 0
+        self._last_probe_send_time_us: int | None = None
 
     async def pace(
         self,
@@ -384,7 +385,10 @@ class AsyncRtpPacer:
             else:
                 self._model.set_config(config, now_us)
 
-            wait_us = self._wait_time_us(size_bytes, now_us)
+            wait_us = max(
+                self._wait_time_us(size_bytes, now_us),
+                self._probe_wait_time_us(pacing_info, now_us),
+            )
             if wait_us > 0:
                 await asyncio.sleep(wait_us / 1_000_000)
                 if use_current_clock:
@@ -396,6 +400,7 @@ class AsyncRtpPacer:
             if pacing_info.is_probe:
                 self._probe_sent_packets += 1
                 self._probe_sent_bytes += size_bytes
+                self._last_probe_send_time_us = now_us
                 if (
                     self._probe_sent_packets >= pacing_info.probe_cluster_min_probes
                     and self._probe_sent_bytes >= pacing_info.probe_cluster_min_bytes
@@ -427,6 +432,23 @@ class AsyncRtpPacer:
             ),
         )
 
+    def _probe_wait_time_us(
+        self, pacing_info: PacedPacketInfo, now_us: int
+    ) -> int:
+        if (
+            not pacing_info.is_probe
+            or self._last_probe_send_time_us is None
+            or pacing_info.probe_cluster_min_delta_us <= 0
+        ):
+            return 0
+
+        return max(
+            0,
+            self._last_probe_send_time_us
+            + pacing_info.probe_cluster_min_delta_us
+            - now_us,
+        )
+
     def _pacing_info_for_packet(self, config: PacerConfig) -> PacedPacketInfo:
         probe = config.probe_cluster
         if probe is None or probe.id in self._completed_probe_cluster_ids:
@@ -435,4 +457,5 @@ class AsyncRtpPacer:
             self._active_probe_cluster_id = probe.id
             self._probe_sent_bytes = 0
             self._probe_sent_packets = 0
+            self._last_probe_send_time_us = None
         return probe.pacing_info

@@ -23,9 +23,21 @@ from .transportcontrol import (
 from .transporttrace import TransportCcTraceWriter
 
 logger = logging.getLogger(__name__)
-_TELEMETRY_INTERVAL_MS = int(
-    os.environ.get("AIORTC_TRANSPORT_CC_TELEMETRY_INTERVAL_MS", "10000")
-)
+
+
+def _get_telemetry_interval_ms() -> int:
+    interval_ms = os.environ.get("AIORTC_TRANSPORT_CC_TELEMETRY_INTERVAL_MS")
+    if interval_ms is not None:
+        return int(interval_ms)
+
+    interval_seconds = os.environ.get("AIORTC_TRANSPORT_CC_TELEMETRY_INTERVAL")
+    if interval_seconds is not None:
+        return int(float(interval_seconds) * 1000)
+
+    return 10000
+
+
+_TELEMETRY_INTERVAL_MS = _get_telemetry_interval_ms()
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
 
 
