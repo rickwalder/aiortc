@@ -815,6 +815,13 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
+            if (
+                is_retransmission
+                and not self._congestion_controller.allow_retransmission(
+                    size_bytes=len(packet_bytes)
+                )
+            ):
+                return
             await self._send_rtp(packet_bytes)
 
             transport_sequence_number = packet.extensions.transport_sequence_number
@@ -838,13 +845,20 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         is_retransmission: bool = False,
     ) -> None:
         async with self._rtp_send_lock:
+            packet.extensions.abs_send_time = (
+                clock.current_ntp_time() >> 14
+            ) & 0x00FFFFFF
+            if is_retransmission:
+                estimated_size_bytes = len(packet.serialize(extensions_map)) + 8
+                if not self._congestion_controller.allow_retransmission(
+                    size_bytes=estimated_size_bytes
+                ):
+                    return
+
             if extensions_map.has_transport_sequence_number:
                 packet.extensions.transport_sequence_number = (
                     self._congestion_controller.next_transport_sequence_number()
                 )
-            packet.extensions.abs_send_time = (
-                clock.current_ntp_time() >> 14
-            ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
             queued = _QueuedRtpPacket(
                 packet=packet,

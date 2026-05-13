@@ -360,6 +360,19 @@ class TransportCongestionControllerTest(TestCase):
 
         self.assertEqual(mock_pace.await_count, 2)
 
+    def test_retransmission_rate_limiter_uses_transport_target_window(self) -> None:
+        controller = TransportCongestionController()
+
+        self.assertTrue(
+            controller.allow_retransmission(size_bytes=450_000, now_ms=0)
+        )
+        self.assertFalse(
+            controller.allow_retransmission(size_bytes=20_000, now_ms=0)
+        )
+        self.assertTrue(
+            controller.allow_retransmission(size_bytes=20_000, now_ms=501)
+        )
+
     def test_initial_allocation_splits_pycc_transport_target_evenly(self) -> None:
         controller = TransportCongestionController()
         senders = [DummySender(1000 + i) for i in range(3)]

@@ -404,6 +404,45 @@ class RTCDtlsTransportTest(TestCase):
         )
 
     @asynctest
+    async def test_send_rtp_packet_limits_retransmission_before_twcc(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(
+            RTCRtpSendParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(
+                        id=5,
+                        uri=TRANSPORT_CC_URI,
+                    )
+                ]
+            )
+        )
+        session._congestion_controller.allow_retransmission = Mock(
+            return_value=False
+        )
+        session._congestion_controller.next_transport_sequence_number = Mock()
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+            is_retransmission=True,
+        )
+
+        self.assertIsNone(packet.extensions.transport_sequence_number)
+        self.assertEqual(len(session._rtp_queue), 0)
+        session._congestion_controller.next_transport_sequence_number.assert_not_called()
+
+    @asynctest
     async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(

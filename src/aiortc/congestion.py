@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from . import clock
 from .rate import RemoteBitrateEstimator
 from .rtp import (
     RTCP_PSFB_APP,
@@ -39,6 +41,7 @@ def _get_telemetry_interval_ms() -> int:
 
 _TELEMETRY_INTERVAL_MS = _get_telemetry_interval_ms()
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
+_RETRANSMISSION_RATE_LIMIT_WINDOW_MS = 500
 
 
 class CongestionControlledSender(Protocol):
@@ -72,7 +75,43 @@ class TelemetrySnapshot:
     acknowledged_bytes: int
     lost_bytes: int
     prior_unacked_bytes: int
+    retransmission_sent_bytes: int
+    retransmission_limited_bytes: int
+    retransmission_limited_packets: int
     encoded_payload_bytes_by_ssrc: dict[int, int]
+
+
+class _RateLimiter:
+    def __init__(self, window_ms: int) -> None:
+        self.__window_ms = window_ms
+        self.__max_rate_bps = 0
+        self.__events: deque[tuple[int, int]] = deque()
+        self.__bytes_in_window = 0
+
+    def set_max_rate(self, rate_bps: int) -> None:
+        self.__max_rate_bps = max(0, rate_bps)
+
+    def try_use(self, size_bytes: int, now_ms: int) -> bool:
+        if size_bytes <= 0:
+            return True
+
+        self.__trim(now_ms)
+        if self.__max_rate_bps <= 0:
+            return False
+
+        max_window_bytes = self.__max_rate_bps * self.__window_ms // 8000
+        if self.__bytes_in_window + size_bytes > max_window_bytes:
+            return False
+
+        self.__events.append((now_ms, size_bytes))
+        self.__bytes_in_window += size_bytes
+        return True
+
+    def __trim(self, now_ms: int) -> None:
+        cutoff_ms = now_ms - self.__window_ms
+        while self.__events and self.__events[0][0] <= cutoff_ms:
+            _, size_bytes = self.__events.popleft()
+            self.__bytes_in_window -= size_bytes
 
 
 class TransportCongestionController:
@@ -97,6 +136,12 @@ class TransportCongestionController:
             trace_writer=self.__trace_writer
         )
         self.__rtp_pacer = AsyncRtpPacer()
+        self.__retransmission_rate_limiter = _RateLimiter(
+            _RETRANSMISSION_RATE_LIMIT_WINDOW_MS
+        )
+        self.__retransmission_sent_bytes = 0
+        self.__retransmission_limited_bytes = 0
+        self.__retransmission_limited_packets = 0
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
@@ -154,6 +199,23 @@ class TransportCongestionController:
     def next_transport_sequence_number(self) -> int:
         return self.__transport_control.next_transport_sequence_number()
 
+    def allow_retransmission(
+        self, *, size_bytes: int, now_ms: Optional[int] = None
+    ) -> bool:
+        now_ms = (
+            clock.current_monotonic_us() // 1000
+            if now_ms is None
+            else now_ms
+        )
+        target_bitrate = self.__transport_control.get_target_bitrate()
+        self.__retransmission_rate_limiter.set_max_rate(target_bitrate)
+        if self.__retransmission_rate_limiter.try_use(size_bytes, now_ms):
+            return True
+
+        self.__retransmission_limited_packets += 1
+        self.__retransmission_limited_bytes += max(0, size_bytes)
+        return False
+
     def on_packet_sent(
         self,
         *,
@@ -166,6 +228,8 @@ class TransportCongestionController:
         is_retransmission: bool = False,
         pacing_info: Optional[PacedPacketInfo] = None,
     ) -> None:
+        if is_retransmission:
+            self.__retransmission_sent_bytes += max(0, size_bytes)
         self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
         self.__transport_control.on_packet_sent(
             TransportControlSentPacket(
@@ -535,6 +599,9 @@ class TransportCongestionController:
             acked_rate_bps = 0
             lost_rate_bps = 0
             prior_unacked_rate_bps = 0
+            retransmission_sent_rate_bps = 0
+            retransmission_limited_rate_bps = 0
+            retransmission_limited_packets = 0
             encoded_rate_bps_by_ssrc = {state.sender._ssrc: 0 for state in states}
         else:
             elapsed_ms = now_ms - self.__last_telemetry_snapshot.now_ms
@@ -565,6 +632,26 @@ class TransportCongestionController:
                 * 8
                 / elapsed_s
             )
+            retransmission_sent_rate_bps = int(
+                (
+                    self.__retransmission_sent_bytes
+                    - self.__last_telemetry_snapshot.retransmission_sent_bytes
+                )
+                * 8
+                / elapsed_s
+            )
+            retransmission_limited_rate_bps = int(
+                (
+                    self.__retransmission_limited_bytes
+                    - self.__last_telemetry_snapshot.retransmission_limited_bytes
+                )
+                * 8
+                / elapsed_s
+            )
+            retransmission_limited_packets = (
+                self.__retransmission_limited_packets
+                - self.__last_telemetry_snapshot.retransmission_limited_packets
+            )
             encoded_rate_bps_by_ssrc = {}
             for state in states:
                 ssrc = state.sender._ssrc
@@ -587,6 +674,9 @@ class TransportCongestionController:
             acknowledged_bytes=telemetry.acknowledged_bytes,
             lost_bytes=telemetry.lost_bytes,
             prior_unacked_bytes=telemetry.prior_unacked_bytes,
+            retransmission_sent_bytes=self.__retransmission_sent_bytes,
+            retransmission_limited_bytes=self.__retransmission_limited_bytes,
+            retransmission_limited_packets=self.__retransmission_limited_packets,
             encoded_payload_bytes_by_ssrc={
                 state.sender._ssrc: state.encoded_payload_bytes for state in states
             },
@@ -617,7 +707,8 @@ class TransportCongestionController:
             "target_bps=%d pacer_bps=%d "
             "allocated_bps=%d applied_bps=%d encoder_bps=%d "
             "encoded_observed_bps=%d sent_bps=%d acked_bps=%d lost_bps=%d "
-            "prior_unacked_bps=%d sent_fill=%.2f acked_fill=%.2f "
+            "prior_unacked_bps=%d rtx_sent_bps=%d rtx_limited_bps=%d "
+            "rtx_limited_packets=%d sent_fill=%.2f acked_fill=%.2f "
             "in_flight=%d pacing_queue=%d pacing_queue_ms=%d "
             "oldest_in_flight_ms=%d history=%d "
             "twcc_next=%d fb_base=%d fb_count=%d delay_usage=%s aimd=%s "
@@ -649,6 +740,9 @@ class TransportCongestionController:
             acked_rate_bps,
             lost_rate_bps,
             prior_unacked_rate_bps,
+            retransmission_sent_rate_bps,
+            retransmission_limited_rate_bps,
+            retransmission_limited_packets,
             sent_fill_ratio,
             acked_fill_ratio,
             telemetry.data_in_flight_bytes,
