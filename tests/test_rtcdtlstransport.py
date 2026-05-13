@@ -38,7 +38,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from pycc import TRANSPORT_CC_URI, PacedPacketInfo
+from pycc import TRANSPORT_CC_URI, PacedPacketInfo, TransportCc
 
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -308,6 +308,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -365,6 +366,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -418,6 +420,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -457,6 +460,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         sender = DummyRtpSender()
         sender._ssrc = 1234
@@ -490,6 +494,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         receiver = TwccDummyRtpReceiver()
         parameters = RTCRtpReceiveParameters(
@@ -545,6 +550,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
+            congestion_control=[TransportCc()],
         )
         receiver = TwccDummyRtpReceiver()
         parameters = RTCRtpReceiveParameters(

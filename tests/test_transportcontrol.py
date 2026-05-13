@@ -4,23 +4,37 @@ import tempfile
 from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
-from aiortc.codecs import CODECS, HEADER_EXTENSIONS, init_codecs, is_rtx
+from aiortc.codecs import (
+    CODECS,
+    HEADER_EXTENSIONS,
+    get_codec_parameters,
+    get_header_extension_parameters,
+    is_rtx,
+)
 from aiortc.congestion import TransportCongestionController
+from aiortc.rtccomponents import get_congestion_control_capabilities
+from aiortc.rtcpeerconnection import RTCPeerConnection
 from aiortc.rtcrtpparameters import RTCRtcpFeedback
 from aiortc.rtp import RtcpPsfbPacket, RtcpTransportLayerCcPacket, RtpPacket
-from aiortc.transportcontrol import (
-    RTCP_RTPFB,
-    TRANSPORT_CC_DISABLE_ENV,
-    TRANSPORT_CC_HEADER_EXTENSION_ID,
-    AsyncRtpPacer,
-    PyccTransportControlProvider,
-    TransportControlSentPacket,
-    get_transport_control_capabilities,
-    is_transport_control_enabled,
-)
 from aiortc.transporttrace import NetTraceWriter
-from pycc import RTPFB_TRANSPORT_CC_FMT, TRANSPORT_CC_URI
+from pycc import (
+    ABS_SEND_TIME_URI,
+    RTCP_RTPFB,
+    RTPFB_TRANSPORT_CC_FMT,
+    TRANSPORT_CC_HEADER_EXTENSION_ID,
+    TRANSPORT_CC_URI,
+    AsyncRtpPacer,
+    Remb,
+    TransportCc,
+    TransportCcController,
+    TransportControlSentPacket,
+)
 from pycc.types import PacerConfig, ProbeClusterConfig
+from rtc_types import (
+    RtcCapabilities,
+    RtcpFeedbackCapability,
+    RtcpFeedbackPacketCapability,
+)
 
 from .utils import asynctest
 
@@ -48,17 +62,57 @@ class DummySender:
         self.applied_bitrates.append(bitrate)
 
 
+class DummyBoundedSender(DummySender):
+    def _get_bitrate_bounds(self) -> tuple[int, int]:
+        return (500_000, 3_000_000)
+
+
 class TransportControlCapabilitiesTest(TestCase):
-    def test_audio_capabilities_are_empty(self) -> None:
-        capabilities = get_transport_control_capabilities("audio")
+    def test_transport_cc_audio_capabilities_are_empty(self) -> None:
+        capabilities = get_congestion_control_capabilities(
+            "audio",
+            components=[TransportCc()],
+        )
 
         self.assertEqual(capabilities.rtcp_feedback, [])
         self.assertEqual(capabilities.rtp_header_extensions, [])
         self.assertEqual(capabilities.rtcp_feedback_formats, [])
 
-    def test_video_capabilities_include_transport_cc(self) -> None:
-        capabilities = get_transport_control_capabilities("video")
+    def test_congestion_control_capabilities_are_empty_by_default(self) -> None:
+        capabilities = get_congestion_control_capabilities("video")
 
+        self.assertEqual(capabilities.rtcp_feedback, [])
+        self.assertEqual(capabilities.rtp_header_extensions, [])
+        self.assertEqual(capabilities.rtcp_feedback_formats, [])
+
+    def test_congestion_control_capabilities_include_configured_remb(self) -> None:
+        capabilities = get_congestion_control_capabilities(
+            "video",
+            components=[Remb()],
+        )
+
+        self.assertEqual(
+            capabilities.rtcp_feedback,
+            [RTCRtcpFeedback(type="goog-remb")],
+        )
+        self.assertEqual(
+            [extension.uri for extension in capabilities.rtp_header_extensions],
+            [ABS_SEND_TIME_URI],
+        )
+        self.assertEqual(capabilities.rtcp_feedback_formats, [])
+
+    def test_video_capabilities_are_empty_by_default(self) -> None:
+        capabilities = get_congestion_control_capabilities("video")
+
+        self.assertEqual(capabilities.rtcp_feedback, [])
+        self.assertEqual(capabilities.rtp_header_extensions, [])
+        self.assertEqual(capabilities.rtcp_feedback_formats, [])
+
+    def test_configured_transport_cc_includes_transport_cc_capabilities(self) -> None:
+        capabilities = get_congestion_control_capabilities(
+            "video",
+            components=[TransportCc()],
+        )
         self.assertEqual(len(capabilities.rtcp_feedback), 1)
         self.assertEqual(capabilities.rtcp_feedback[0].type, "transport-cc")
         self.assertEqual(len(capabilities.rtp_header_extensions), 1)
@@ -72,57 +126,114 @@ class TransportControlCapabilitiesTest(TestCase):
             [(RTCP_RTPFB, RTPFB_TRANSPORT_CC_FMT)],
         )
 
-    def test_disable_env_suppresses_transport_cc_capabilities(self) -> None:
-        with patch.dict(os.environ, {TRANSPORT_CC_DISABLE_ENV: "1"}):
-            capabilities = get_transport_control_capabilities("video")
+    def test_configured_components_include_twcc_in_capabilities(self) -> None:
+        capabilities = get_congestion_control_capabilities(
+            "video",
+            components=[
+                Remb(),
+                TransportCc(),
+            ],
+        )
 
-            self.assertFalse(is_transport_control_enabled("video"))
-        self.assertEqual(capabilities.rtcp_feedback, [])
+        self.assertEqual(
+            capabilities.rtcp_feedback,
+            [RTCRtcpFeedback(type="goog-remb"), RTCRtcpFeedback(type="transport-cc")],
+        )
+        self.assertEqual(
+            [extension.uri for extension in capabilities.rtp_header_extensions],
+            [ABS_SEND_TIME_URI, TRANSPORT_CC_URI],
+        )
+        self.assertEqual(
+            capabilities.rtcp_feedback_formats,
+            [(RTCP_RTPFB, RTPFB_TRANSPORT_CC_FMT)],
+        )
+
+    def test_congestion_control_capabilities_can_use_components(self) -> None:
+        class FakeRegime:
+            name = "fake"
+
+            def capabilities(self, kind: str) -> RtcCapabilities:
+                if kind != "video":
+                    return RtcCapabilities()
+                return RtcCapabilities(
+                    rtcp_feedback=[RtcpFeedbackCapability(type="fake-cc")],
+                    rtp_header_extensions=[],
+                    rtcp_feedback_packets=[
+                        RtcpFeedbackPacketCapability(packet_type=123, fmt=4)
+                    ],
+                )
+
+        capabilities = get_congestion_control_capabilities(
+            "video",
+            components=[FakeRegime()],
+        )
+
+        self.assertEqual(capabilities.rtcp_feedback, [RTCRtcpFeedback("fake-cc")])
         self.assertEqual(capabilities.rtp_header_extensions, [])
-        self.assertEqual(capabilities.rtcp_feedback_formats, [])
+        self.assertEqual(capabilities.rtcp_feedback_formats, [(123, 4)])
 
-    def test_video_codec_registry_includes_transport_cc_capabilities(self) -> None:
-        capabilities = get_transport_control_capabilities("video")
+    @asynctest
+    async def test_peer_connection_offer_uses_empty_default_components(self) -> None:
+        pc = RTCPeerConnection()
+        pc.addTransceiver("video")
+
+        offer = await pc.createOffer()
+
+        self.assertNotIn("goog-remb", offer.sdp)
+        self.assertNotIn("transport-cc", offer.sdp)
+        await pc.close()
+
+    @asynctest
+    async def test_peer_connection_offer_uses_configured_components(self) -> None:
+        pc = RTCPeerConnection(congestion_control=[Remb()])
+        pc.addTransceiver("video")
+
+        offer = await pc.createOffer()
+
+        self.assertIn("goog-remb", offer.sdp)
+        self.assertNotIn("transport-cc", offer.sdp)
+        await pc.close()
+
+    def test_video_codec_registry_excludes_transport_cc_by_default(self) -> None:
+        self.assertNotIn(
+            TRANSPORT_CC_URI,
+            [extension.uri for extension in HEADER_EXTENSIONS["video"]],
+        )
+        for codec in CODECS["video"]:
+            if not is_rtx(codec):
+                self.assertNotIn(
+                    RTCRtcpFeedback(type="transport-cc"),
+                    codec.rtcpFeedback,
+                )
+
+    def test_configured_components_add_transport_cc_to_codecs(self) -> None:
+        components = [TransportCc()]
+        capabilities = get_congestion_control_capabilities("video", components)
         transport_cc_uri = capabilities.rtp_header_extensions[0].uri
         transport_cc_feedback = capabilities.rtcp_feedback[0]
 
         self.assertIn(
             transport_cc_uri,
-            [extension.uri for extension in HEADER_EXTENSIONS["video"]],
+            [
+                extension.uri
+                for extension in get_header_extension_parameters("video", components)
+            ],
         )
-        for codec in CODECS["video"]:
+        for codec in get_codec_parameters("video", components):
             if not is_rtx(codec):
                 self.assertIn(transport_cc_feedback, codec.rtcpFeedback)
 
-    def test_disable_env_removes_transport_cc_from_codec_registry(self) -> None:
-        try:
-            with patch.dict(os.environ, {TRANSPORT_CC_DISABLE_ENV: "1"}):
-                init_codecs()
 
-                self.assertNotIn(
-                    TRANSPORT_CC_URI,
-                    [extension.uri for extension in HEADER_EXTENSIONS["video"]],
-                )
-                for codec in CODECS["video"]:
-                    if not is_rtx(codec):
-                        self.assertNotIn(
-                            RTCRtcpFeedback(type="transport-cc"),
-                            codec.rtcpFeedback,
-                        )
-        finally:
-            init_codecs()
-
-
-class PyccTransportControlProviderTest(TestCase):
+class TransportCcControllerTest(TestCase):
     def test_sequence_numbers_wrap(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
         provider._transport_sequence_number = 0xFFFF
 
         self.assertEqual(provider.next_transport_sequence_number(), 0xFFFF)
         self.assertEqual(provider.next_transport_sequence_number(), 0)
 
     def test_observe_incoming_rtp_builds_feedback(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
 
         feedback = provider.observe_incoming_rtp(
             media_ssrc=1234,
@@ -138,7 +249,7 @@ class PyccTransportControlProviderTest(TestCase):
         self.assertEqual(feedback[0].base_sequence_number, 55)
 
     def test_get_pacer_config(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
 
         config = provider.get_pacer_config()
 
@@ -146,12 +257,12 @@ class PyccTransportControlProviderTest(TestCase):
         self.assertGreater(config.data_window_bytes, 0)
 
     def test_get_target_bitrate_uses_pycc_defaults(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
 
         self.assertEqual(provider.get_target_bitrate(), 7_500_000)
 
     def test_update_pacing_queue_is_reflected_in_telemetry(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
 
         provider.update_pacing_queue(12345)
 
@@ -167,7 +278,7 @@ class AsyncRtpPacerTest(TestCase):
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        with patch("aiortc.transportcontrol.asyncio.sleep", new=fake_sleep):
+        with patch("pycc.runtime.asyncio.sleep", new=fake_sleep):
             await pacer.pace(
                 size_bytes=1500,
                 config=PacerConfig(send_bitrate_bps=300_000, window_us=40_000),
@@ -198,7 +309,7 @@ class AsyncRtpPacerTest(TestCase):
             )
             order.append(("sent", name))
 
-        with patch("aiortc.transportcontrol.asyncio.sleep", new=fake_sleep):
+        with patch("pycc.runtime.asyncio.sleep", new=fake_sleep):
             await pace_packet("first")
             await pace_packet("second")
 
@@ -247,7 +358,7 @@ class AsyncRtpPacerTest(TestCase):
             ),
         )
 
-        with patch("aiortc.transportcontrol.asyncio.sleep", new=fake_sleep):
+        with patch("pycc.runtime.asyncio.sleep", new=fake_sleep):
             await pacer.pace(size_bytes=500, config=config, now_ms=0)
             await pacer.pace(size_bytes=500, config=config, now_ms=0)
 
@@ -276,7 +387,7 @@ class AsyncRtpPacerTest(TestCase):
         self.assertFalse(pacer.is_probe_pending(config))
 
     def test_handle_feedback_activates_provider(self) -> None:
-        provider = PyccTransportControlProvider()
+        provider = TransportCcController()
         sequence_number = provider.next_transport_sequence_number()
         provider.on_packet_sent(
             TransportControlSentPacket(
@@ -316,7 +427,7 @@ class AsyncRtpPacerTest(TestCase):
     def test_trace_writer_records_sent_and_feedback(self) -> None:
         with tempfile.NamedTemporaryFile() as fp:
             trace_writer = NetTraceWriter(fp.name)
-            provider = PyccTransportControlProvider(trace_writer=trace_writer)
+            provider = TransportCcController(trace_writer=trace_writer)
             sequence_number = provider.next_transport_sequence_number()
             provider.on_packet_sent(
                 TransportControlSentPacket(
@@ -364,7 +475,7 @@ class AsyncRtpPacerTest(TestCase):
 
 class TransportCongestionControllerTest(TestCase):
     def test_incoming_twcc_rtp_delegates_to_provider(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
 
@@ -381,7 +492,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(twcc.base_sequence_number, 77)
 
     def test_incoming_twcc_feedback_respects_receiver_cadence(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
 
@@ -408,7 +519,7 @@ class TransportCongestionControllerTest(TestCase):
         )
 
     def test_incoming_twcc_feedback_reports_missing_sequences(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
 
@@ -430,7 +541,7 @@ class TransportCongestionControllerTest(TestCase):
         )
 
     def test_incoming_twcc_suppresses_remb_fallback_once_active(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([Remb(), TransportCc()])
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
         estimator = controller._TransportCongestionController__remote_bitrate_estimator
@@ -467,7 +578,7 @@ class TransportCongestionControllerTest(TestCase):
     def test_incoming_remb_writes_separate_trace(self) -> None:
         with tempfile.NamedTemporaryFile() as fp:
             with patch.dict(os.environ, {"AIORTC_NET_TRACE": fp.name}):
-                controller = TransportCongestionController()
+                controller = TransportCongestionController([Remb()])
             receiver = DummyReceiver()
             controller.register_receiver(receiver)
             estimator = (
@@ -509,7 +620,8 @@ class TransportCongestionControllerTest(TestCase):
         with tempfile.NamedTemporaryFile() as fp:
             with patch.dict(os.environ, {"AIORTC_NET_TRACE": fp.name}):
                 controller = TransportCongestionController()
-            controller.register_sender(DummySender(ssrc=1234))
+            sender = DummySender(ssrc=1234)
+            controller.register_sender(sender)
 
             controller.update_receiver_estimate(
                 bitrate=1_000_000,
@@ -531,9 +643,78 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(records[1]["accepted"], True)
         self.assertEqual(records[1]["reason"], "accepted")
         self.assertEqual(records[1]["bitrate_bps"], 1_000_000)
+        self.assertEqual(
+            records[1]["allocations"],
+            [
+                {
+                    "ssrc": 1234,
+                    "allocated_bitrate_bps": 1_000_000,
+                    "applied_bitrate_bps": 1_000_000,
+                    "encoder_bitrate_bps": 1_000_000,
+                }
+            ],
+        )
+
+    def test_small_receiver_estimate_changes_do_not_reconfigure_sender(self) -> None:
+        controller = TransportCongestionController([TransportCc()])
+        sender = DummySender(ssrc=1234)
+        controller.register_sender(sender)
+
+        controller.update_receiver_estimate(
+            bitrate=3_000_000,
+            ssrcs=[1234],
+            now_ms=100,
+        )
+        controller.update_receiver_estimate(
+            bitrate=3_010_000,
+            ssrcs=[1234],
+            now_ms=300,
+        )
+        controller.update_receiver_estimate(
+            bitrate=3_040_000,
+            ssrcs=[1234],
+            now_ms=500,
+        )
+
+        self.assertEqual(sender.applied_bitrates[-2:], [3_000_000, 3_040_000])
+
+    def test_sender_target_application_respects_sender_bounds(self) -> None:
+        controller = TransportCongestionController([TransportCc()])
+        sender = DummyBoundedSender(ssrc=1234)
+        controller.register_sender(sender)
+
+        controller.update_receiver_estimate(
+            bitrate=14_000_000,
+            ssrcs=[1234],
+            now_ms=100,
+        )
+        controller.update_receiver_estimate(
+            bitrate=14_100_000,
+            ssrcs=[1234],
+            now_ms=300,
+        )
+
+        self.assertEqual(sender.target_bitrate, 3_000_000)
+        self.assertEqual(sender.applied_bitrates, [3_000_000])
+
+    def test_sender_target_application_snaps_to_bound_within_hysteresis(self) -> None:
+        controller = TransportCongestionController([TransportCc()])
+        sender = DummyBoundedSender(ssrc=1234, target_bitrate=2_980_000)
+        controller.register_sender(sender)
+        sender.target_bitrate = 2_980_000
+        sender.applied_bitrates.clear()
+
+        controller.update_receiver_estimate(
+            bitrate=3_010_000,
+            ssrcs=[1234],
+            now_ms=100,
+        )
+
+        self.assertEqual(sender.target_bitrate, 3_000_000)
+        self.assertEqual(sender.applied_bitrates, [3_000_000])
 
     def test_get_pacer_config_delegates_to_provider(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
 
         config = controller.get_pacer_config()
 
@@ -542,10 +723,10 @@ class TransportCongestionControllerTest(TestCase):
 
     @asynctest
     async def test_pace_rtp_packet_uses_transport_controller_pacer(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
 
         with patch(
-            "aiortc.congestion.AsyncRtpPacer.pace",
+            "pycc.runtime.AsyncRtpPacer.pace",
             new_callable=AsyncMock,
         ) as mock_pace:
             await controller.pace_rtp_packet(size_bytes=1200, now_ms=100)
@@ -554,7 +735,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(mock_pace.await_count, 2)
 
     def test_retransmission_rate_limiter_uses_transport_target_window(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
 
         self.assertTrue(
             controller.allow_retransmission(size_bytes=450_000, now_ms=0)
@@ -567,7 +748,7 @@ class TransportCongestionControllerTest(TestCase):
         )
 
     def test_initial_allocation_splits_pycc_transport_target_evenly(self) -> None:
-        controller = TransportCongestionController()
+        controller = TransportCongestionController([TransportCc()])
         senders = [DummySender(1000 + i) for i in range(3)]
 
         for sender in senders:

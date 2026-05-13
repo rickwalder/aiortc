@@ -8,13 +8,13 @@ from typing import Any, Optional, Union
 from av import AudioFrame
 from pycc import (
     RTPFB_TRANSPORT_CC_FMT,
+    TRANSPORT_CC_URI,
     TransportLayerCcPacket,
     parse_transport_layer_cc,
     serialize_transport_layer_cc,
 )
 
 from .rtcrtpparameters import RTCRtpParameters
-from .transportcontrol import TRANSPORT_CC_URI
 
 # used for NACK and retransmission
 RTP_HISTORY_SIZE = 128

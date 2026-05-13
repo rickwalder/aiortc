@@ -8,6 +8,7 @@ from .mediastreams import (
     MediaStreamTrack,
     VideoStreamTrack,
 )
+from .rtccomponents import DEFAULT_CONGESTION_CONTROL_COMPONENTS
 from .rtcconfiguration import RTCBundlePolicy, RTCConfiguration, RTCIceServer
 from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from .rtcdtlstransport import (
@@ -57,6 +58,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
     "AudioStreamTrack",
+    "DEFAULT_CONGESTION_CONTROL_COMPONENTS",
     "InvalidAccessError",
     "InvalidStateError",
     "MediaStreamError",

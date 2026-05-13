@@ -33,6 +33,7 @@ dependencies = [
     "pycc",
     "pylibsrtp>=0.10.0",
     "pyopenssl>=25.0.0",
+    "rtc-types",
 ]
 dynamic = ["version"]
 
@@ -76,6 +77,7 @@ known-third-party = ["aiortc"]
 
 [tool.uv.sources]
 pycc = { git = "ssh://git@github.com/Weave-Robotics/pycc.git", rev = "main" }
+rtc-types = { git = "ssh://git@github.com/Weave-Robotics/rtc-types.git", rev = "main" }
 
 [tool.setuptools.dynamic]
 version = {attr = "aiortc.__version__"}

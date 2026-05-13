@@ -276,6 +276,7 @@ class NetTraceWriter:
         accepted: bool,
         reason: str,
         sender_count: int,
+        allocations: list[dict[str, Any]] | None = None,
     ) -> None:
         self.write_event(
             "receiver-estimate",
@@ -289,6 +290,7 @@ class NetTraceWriter:
             accepted=accepted,
             reason=reason,
             sender_count=sender_count,
+            allocations=allocations or [],
         )
 
     def write_event(self, event_type: str, **payload: Any) -> None:

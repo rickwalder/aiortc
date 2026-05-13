@@ -7,7 +7,7 @@ import os
 import traceback
 from collections import deque
 from dataclasses import dataclass, field, replace
-from typing import Optional, Protocol, Type, TypeVar, Union
+from typing import Any, Optional, Protocol, Type, TypeVar, Union
 
 import pylibsrtp
 from cryptography import x509
@@ -391,7 +391,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
     """
 
     def __init__(
-        self, transport: RTCIceTransport, certificates: list[RTCCertificate]
+        self,
+        transport: RTCIceTransport,
+        certificates: list[RTCCertificate],
+        *,
+        congestion_control: list[Any] | tuple[Any, ...] | None = None,
     ) -> None:
         assert len(certificates) == 1
         certificate = certificates[0]
@@ -406,7 +410,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue: deque[_QueuedRtpPacket] = deque()
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
-        self._congestion_controller = TransportCongestionController()
+        self._congestion_controller = TransportCongestionController(
+            congestion_control
+        )
         self._rtp_pacer_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))

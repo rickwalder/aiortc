@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiortc import MediaStreamTrack
 from aiortc.codecs import PCMU_CODEC
+from aiortc.congestion import TransportCongestionController
 from aiortc.exceptions import InvalidStateError
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiortc.rtcrtpparameters import (
@@ -29,7 +30,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from aiortc.stats import RTCStatsReport
-from pycc import TRANSPORT_CC_URI
+from pycc import TransportCc
 
 from tests.test_mediastreams import VideoPacketStreamTrack
 
@@ -118,12 +119,6 @@ class RTCRtpSenderTest(TestCase):
             [
                 RTCRtpHeaderExtensionCapability(
                     uri="urn:ietf:params:rtp-hdrext:sdes:mid"
-                ),
-                RTCRtpHeaderExtensionCapability(
-                    uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-                ),
-                RTCRtpHeaderExtensionCapability(
-                    uri=TRANSPORT_CC_URI
                 ),
             ],
         )
@@ -320,9 +315,12 @@ class RTCRtpSenderTest(TestCase):
 
         async with dummy_dtls_transport_pair() as (local_transport, _):
             local_transport._send_rtp = mock_send_rtp  # type: ignore
+            local_transport._congestion_controller = TransportCongestionController(
+                [TransportCc()]
+            )
 
             with patch(
-                "aiortc.congestion.AsyncRtpPacer.pace",
+                "pycc.runtime.AsyncRtpPacer.pace",
                 new_callable=AsyncMock,
             ) as mock_pace:
                 sender = RTCRtpSender(VideoStreamTrack(), local_transport)

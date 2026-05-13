@@ -29,7 +29,6 @@ from aiortc.rtcrtpreceiver import (
 from aiortc.rtp import RtcpPacket, RtpPacket
 from aiortc.stats import RTCStatsReport
 from aiortc.utils import uint16_add
-from pycc import TRANSPORT_CC_URI
 
 from .codecs import CodecTestCase
 from .utils import ClosedDtlsTransport, asynctest, dummy_dtls_transport_pair, load
@@ -295,12 +294,6 @@ class RTCRtpReceiverTest(CodecTestCase):
             [
                 RTCRtpHeaderExtensionCapability(
                     uri="urn:ietf:params:rtp-hdrext:sdes:mid"
-                ),
-                RTCRtpHeaderExtensionCapability(
-                    uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-                ),
-                RTCRtpHeaderExtensionCapability(
-                    uri=TRANSPORT_CC_URI
                 ),
             ],
         )

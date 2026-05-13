@@ -2,12 +2,12 @@ import asyncio
 import copy
 import logging
 import uuid
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from pyee.asyncio import AsyncIOEventEmitter
 
 from . import clock, rtp, sdp
-from .codecs import CODECS, HEADER_EXTENSIONS, is_rtx
+from .codecs import get_codec_parameters, get_header_extension_parameters, is_rtx
 from .events import RTCTrackEvent
 from .exceptions import (
     InternalError,
@@ -16,6 +16,7 @@ from .exceptions import (
     OperationError,
 )
 from .mediastreams import MediaStreamTrack
+from .rtccomponents import DEFAULT_CONGESTION_CONTROL_COMPONENTS
 from .rtcconfiguration import RTCBundlePolicy, RTCConfiguration
 from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from .rtcdtlstransport import RTCCertificate, RTCDtlsParameters, RTCDtlsTransport
@@ -41,6 +42,9 @@ from .rtcrtptransceiver import RTCRtpTransceiver
 from .rtcsctptransport import RTCSctpCapabilities, RTCSctpTransport
 from .rtcsessiondescription import RTCSessionDescription
 from .stats import RTCStatsReport
+
+if TYPE_CHECKING:
+    from rtc_types import RtcCapabilityProvider
 
 DISCARD_HOST = "0.0.0.0"
 DISCARD_PORT = 9
@@ -290,11 +294,21 @@ class RTCPeerConnection(AsyncIOEventEmitter):
     :param configuration: An optional :class:`RTCConfiguration`.
     """
 
-    def __init__(self, configuration: Optional[RTCConfiguration] = None) -> None:
+    def __init__(
+        self,
+        configuration: Optional[RTCConfiguration] = None,
+        *,
+        congestion_control: Optional[list["RtcCapabilityProvider"]] = None,
+    ) -> None:
         super().__init__()
         self.__certificates = [RTCCertificate.generateCertificate()]
         self.__cname = f"{uuid.uuid4()}"
         self.__configuration = configuration or RTCConfiguration()
+        self.__congestion_control = tuple(
+            congestion_control
+            if congestion_control is not None
+            else DEFAULT_CONGESTION_CONTROL_COMPONENTS
+        )
         self.__dtlsTransports: set[RTCDtlsTransport] = set()
         self.__iceTransports: set[RTCIceTransport] = set()
         self.__remoteDtls: dict[
@@ -646,9 +660,16 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # offer codecs
         for transceiver in self.__transceivers:
             transceiver._codecs = filter_preferred_codecs(
-                CODECS[transceiver.kind][:], transceiver._preferred_codecs
+                get_codec_parameters(
+                    transceiver.kind,
+                    self.__congestion_control,
+                ),
+                transceiver._preferred_codecs,
             )
-            transceiver._headerExtensions = HEADER_EXTENSIONS[transceiver.kind][:]
+            transceiver._headerExtensions = get_header_extension_parameters(
+                transceiver.kind,
+                self.__congestion_control,
+            )
 
         mids = self.__seenMids.copy()
 
@@ -917,7 +938,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
 
                 # negotiate codecs
                 common = filter_preferred_codecs(
-                    find_common_codecs(CODECS[media.kind], media.rtp.codecs),
+                    find_common_codecs(
+                        get_codec_parameters(
+                            media.kind,
+                            self.__congestion_control,
+                        ),
+                        media.rtp.codecs,
+                    ),
                     transceiver._preferred_codecs,
                 )
 
@@ -930,7 +957,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
 
                 transceiver._codecs = common
                 transceiver._headerExtensions = find_common_header_extensions(
-                    HEADER_EXTENSIONS[media.kind], media.rtp.headerExtensions
+                    get_header_extension_parameters(
+                        media.kind,
+                        self.__congestion_control,
+                    ),
+                    media.rtp.headerExtensions,
                 )
 
                 # configure direction
@@ -1144,7 +1175,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__iceTransports.add(iceTransport)
 
         # create DTLS transport
-        dtlsTransport = RTCDtlsTransport(iceTransport, self.__certificates)
+        dtlsTransport = RTCDtlsTransport(
+            iceTransport,
+            self.__certificates,
+            congestion_control=self.__congestion_control,
+        )
         dtlsTransport.on("statechange", self.__updateConnectionState)
         self.__dtlsTransports.add(dtlsTransport)
 

@@ -1,5 +1,11 @@
 from typing import Optional, Union
 
+from rtc_types import RtcCapabilityProvider
+
+from ..rtccomponents import (
+    DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+    get_congestion_control_capabilities,
+)
 from ..rtcrtpparameters import (
     ParametersDict,
     RTCRtcpFeedback,
@@ -9,7 +15,6 @@ from ..rtcrtpparameters import (
     RTCRtpHeaderExtensionCapability,
     RTCRtpHeaderExtensionParameters,
 )
-from ..transportcontrol import get_transport_control_capabilities
 from .base import Decoder, Encoder
 from .g711 import PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder
 from .g722 import G722Decoder, G722Encoder
@@ -56,49 +61,59 @@ HEADER_EXTENSIONS: dict[str, list[RTCRtpHeaderExtensionParameters]] = {
 }
 
 
-def _build_video_header_extensions() -> list[RTCRtpHeaderExtensionParameters]:
+def _build_video_header_extensions(
+    congestion_control: tuple[RtcCapabilityProvider, ...]
+    | list[RtcCapabilityProvider] = DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+) -> list[RTCRtpHeaderExtensionParameters]:
+    congestion_capabilities = get_congestion_control_capabilities(
+        "video",
+        components=congestion_control,
+    )
     return [
         RTCRtpHeaderExtensionParameters(
             id=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
         ),
-        RTCRtpHeaderExtensionParameters(
-            id=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-        ),
-        *get_transport_control_capabilities("video").rtp_header_extensions,
+        *congestion_capabilities.rtp_header_extensions,
     ]
 
 
-def init_codecs() -> None:
-    CODECS["video"] = []
-    HEADER_EXTENSIONS["video"] = _build_video_header_extensions()
+def _build_video_codecs(
+    congestion_control: tuple[RtcCapabilityProvider, ...]
+    | list[RtcCapabilityProvider] = DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+) -> list[RTCRtpCodecParameters]:
+    codecs = []
     dynamic_pt = 97
+    congestion_capabilities = get_congestion_control_capabilities(
+        "video",
+        components=congestion_control,
+    )
 
     def add_video_codec(
         mimeType: str, parameters: Optional[ParametersDict] = None
     ) -> None:
         nonlocal dynamic_pt
-
         clockRate = 90000
-        CODECS["video"] += [
-            RTCRtpCodecParameters(
-                mimeType=mimeType,
-                clockRate=clockRate,
-                payloadType=dynamic_pt,
-                rtcpFeedback=[
-                    RTCRtcpFeedback(type="nack"),
-                    RTCRtcpFeedback(type="nack", parameter="pli"),
-                    RTCRtcpFeedback(type="goog-remb"),
-                    *get_transport_control_capabilities("video").rtcp_feedback,
-                ],
-                parameters=parameters or {},
-            ),
-            RTCRtpCodecParameters(
-                mimeType="video/rtx",
-                clockRate=clockRate,
-                payloadType=dynamic_pt + 1,
-                parameters={"apt": dynamic_pt},
-            ),
-        ]
+        codecs.extend(
+            [
+                RTCRtpCodecParameters(
+                    mimeType=mimeType,
+                    clockRate=clockRate,
+                    payloadType=dynamic_pt,
+                    rtcpFeedback=[
+                        RTCRtcpFeedback(type="nack"),
+                        RTCRtcpFeedback(type="nack", parameter="pli"),
+                        *congestion_capabilities.rtcp_feedback,
+                    ],
+                    parameters=parameters or {},
+                ),
+                RTCRtpCodecParameters(
+                    mimeType="video/rtx",
+                    clockRate=clockRate,
+                    payloadType=dynamic_pt + 1,
+                    parameters={"apt": dynamic_pt},
+                ),
+            ]
+        )
         dynamic_pt += 2
 
     add_video_codec("video/VP8")
@@ -111,6 +126,46 @@ def init_codecs() -> None:
                 "profile-level-id": profile_level_id,
             },
         )
+    return codecs
+
+
+def get_codec_parameters(
+    kind: str,
+    congestion_control: tuple[RtcCapabilityProvider, ...]
+    | list[RtcCapabilityProvider] = DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+) -> list[RTCRtpCodecParameters]:
+    if kind not in CODECS:
+        raise ValueError(f"cannot get capabilities for unknown media {kind}")
+    if (
+        kind == "video"
+        and congestion_control is not DEFAULT_CONGESTION_CONTROL_COMPONENTS
+    ):
+        return _build_video_codecs(congestion_control)
+    return CODECS[kind][:]
+
+
+def get_header_extension_parameters(
+    kind: str,
+    congestion_control: tuple[RtcCapabilityProvider, ...]
+    | list[RtcCapabilityProvider] = DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+) -> list[RTCRtpHeaderExtensionParameters]:
+    if kind not in HEADER_EXTENSIONS:
+        raise ValueError(f"cannot get capabilities for unknown media {kind}")
+    if (
+        kind == "video"
+        and congestion_control is not DEFAULT_CONGESTION_CONTROL_COMPONENTS
+    ):
+        return _build_video_header_extensions(congestion_control)
+    return HEADER_EXTENSIONS[kind][:]
+
+
+def init_codecs() -> None:
+    CODECS["video"] = _build_video_codecs()
+    HEADER_EXTENSIONS["video"] = _build_video_header_extensions()
+
+    # Keep the historic module globals authoritative for the default component set.
+    # Non-default component sets build their own video codec/header-extension lists
+    # through get_codec_parameters / get_header_extension_parameters.
 
 
 def depayload(codec: RTCRtpCodecParameters, payload: bytes) -> bytes:
@@ -122,13 +177,17 @@ def depayload(codec: RTCRtpCodecParameters, payload: bytes) -> bytes:
         return payload
 
 
-def get_capabilities(kind: str) -> RTCRtpCapabilities:
+def get_capabilities(
+    kind: str,
+    congestion_control: tuple[RtcCapabilityProvider, ...]
+    | list[RtcCapabilityProvider] = DEFAULT_CONGESTION_CONTROL_COMPONENTS,
+) -> RTCRtpCapabilities:
     if kind not in CODECS:
         raise ValueError(f"cannot get capabilities for unknown media {kind}")
 
     codecs = []
     rtx_added = False
-    for params in CODECS[kind]:
+    for params in get_codec_parameters(kind, congestion_control):
         if not is_rtx(params):
             codecs.append(
                 RTCRtpCodecCapability(
@@ -149,7 +208,10 @@ def get_capabilities(kind: str) -> RTCRtpCapabilities:
             rtx_added = True
 
     headerExtensions = []
-    for extension in HEADER_EXTENSIONS[kind]:
+    for extension in get_header_extension_parameters(
+        kind,
+        congestion_control,
+    ):
         headerExtensions.append(RTCRtpHeaderExtensionCapability(uri=extension.uri))
     return RTCRtpCapabilities(codecs=codecs, headerExtensions=headerExtensions)
 
