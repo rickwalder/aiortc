@@ -360,6 +360,46 @@ class RTCDtlsTransportTest(TestCase):
         )
 
     @asynctest
+    async def test_send_video_rtp_packet_without_twcc_bypasses_pacer(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        extensions_map = HeaderExtensionsMap()
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+        session._congestion_controller.next_transport_sequence_number = Mock()
+        session._congestion_controller.pace_rtp_packet = AsyncMock()
+        session._congestion_controller.on_packet_sent = Mock()
+        session._congestion_controller.observe_encoded_frame = Mock()
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+        )
+
+        self.assertEqual(len(sent_packets), 1)
+        self.assertEqual(len(session._rtp_queue), 0)
+        session._congestion_controller.next_transport_sequence_number.assert_not_called()
+        session._congestion_controller.pace_rtp_packet.assert_not_called()
+        session._congestion_controller.on_packet_sent.assert_not_called()
+        session._congestion_controller.observe_encoded_frame.assert_called_once_with(
+            ssrc=1234,
+            payload_bytes=3,
+        )
+
+    @asynctest
     async def test_send_rtp_packet_clones_queued_packet_for_twcc(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(

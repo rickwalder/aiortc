@@ -801,7 +801,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
     ) -> None:
         packet = _clone_rtp_packet(packet)
 
-        if is_video:
+        if is_video and extensions_map.has_transport_sequence_number:
             await self._enqueue_rtp_packet(
                 packet,
                 extensions_map,
@@ -834,6 +834,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                     ssrc=packet.ssrc,
                     rtp_sequence_number=packet.sequence_number,
                     is_retransmission=is_retransmission,
+                )
+            elif is_video:
+                self._congestion_controller.observe_encoded_frame(
+                    ssrc=packet.ssrc,
+                    payload_bytes=payload_size_bytes,
                 )
 
     async def _enqueue_rtp_packet(
