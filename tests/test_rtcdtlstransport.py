@@ -33,12 +33,11 @@ from aiortc.rtp import (
     RtcpRtpfbPacket,
     RtcpSenderInfo,
     RtcpSrPacket,
-    RtcpTransportLayerCcPacket,
     RtpPacket,
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from pycc import TRANSPORT_CC_URI, PacedPacketInfo, TransportCc
+from pycc import TRANSPORT_CC_URI, PacedPacketInfo, TransportCc, TransportLayerCcPacket
 
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -57,6 +56,26 @@ class DummyDataReceiver:
 
     async def _handle_data(self, data: bytes) -> None:
         self.data.append(data)
+
+
+class DummyRtcpReceiveHandler:
+    def __init__(self, emitted_packets: list[AnyRtcpPacket] | None = None) -> None:
+        self.emitted_packets = emitted_packets or []
+        self.packets: list[AnyRtcpPacket] = []
+        self.now_us: list[int] = []
+
+    def on_rtcp_received(self, packet: AnyRtcpPacket, context: object) -> list[object]:
+        self.packets.append(packet)
+        self.now_us.append(getattr(context, "now_us"))
+        return self.emitted_packets
+
+
+class DummyRtcpReceiveComponent:
+    def __init__(self, handler: DummyRtcpReceiveHandler) -> None:
+        self.handler = handler
+
+    def rtcp_receive_handlers(self) -> tuple[DummyRtcpReceiveHandler, ...]:
+        return (self.handler,)
 
 
 class DummyRtpReceiver:
@@ -516,7 +535,7 @@ class RTCDtlsTransportTest(TestCase):
         sent_rtcp: list[AnyRtcpPacket] = []
 
         async def mock_send_rtp(data: bytes) -> None:
-            sent_rtcp.extend(RtcpPacket.parse(data))
+            sent_rtcp.extend(RtcpPacket.parse(data, session._rtcp_packet_registry))
 
         session._send_rtp = mock_send_rtp  # type: ignore
 
@@ -538,11 +557,11 @@ class RTCDtlsTransportTest(TestCase):
         )
         self.assertEqual(len(sent_rtcp), 1)
         feedback = sent_rtcp[0]
-        self.assertIsInstance(feedback, RtcpTransportLayerCcPacket)
-        assert isinstance(feedback, RtcpTransportLayerCcPacket)
-        self.assertEqual(feedback.feedback.sender_ssrc, 4321)
-        self.assertEqual(feedback.feedback.media_ssrc, 1234)
-        self.assertEqual(feedback.feedback.base_sequence_number, 55)
+        self.assertIsInstance(feedback, TransportLayerCcPacket)
+        assert isinstance(feedback, TransportLayerCcPacket)
+        self.assertEqual(feedback.sender_ssrc, 4321)
+        self.assertEqual(feedback.media_ssrc, 1234)
+        self.assertEqual(feedback.base_sequence_number, 55)
 
     @asynctest
     async def test_handle_rtp_data_twcc_feedback_reports_missing_packets(self) -> None:
@@ -572,7 +591,7 @@ class RTCDtlsTransportTest(TestCase):
         sent_rtcp: list[AnyRtcpPacket] = []
 
         async def mock_send_rtp(data: bytes) -> None:
-            sent_rtcp.extend(RtcpPacket.parse(data))
+            sent_rtcp.extend(RtcpPacket.parse(data, session._rtcp_packet_registry))
 
         session._send_rtp = mock_send_rtp  # type: ignore
 
@@ -598,13 +617,39 @@ class RTCDtlsTransportTest(TestCase):
 
         self.assertEqual(len(sent_rtcp), 2)
         feedback = sent_rtcp[-1]
-        self.assertIsInstance(feedback, RtcpTransportLayerCcPacket)
-        assert isinstance(feedback, RtcpTransportLayerCcPacket)
-        self.assertEqual(feedback.feedback.base_sequence_number, 56)
+        self.assertIsInstance(feedback, TransportLayerCcPacket)
+        assert isinstance(feedback, TransportLayerCcPacket)
+        self.assertEqual(feedback.base_sequence_number, 56)
         self.assertEqual(
-            [packet.received for packet in feedback.feedback.packets],
+            [packet.received for packet in feedback.packets],
             [False, True],
         )
+
+    @asynctest
+    async def test_handle_rtcp_data_invokes_receive_handlers(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        emitted_packet = RtcpByePacket(sources=[7777])
+        handler = DummyRtcpReceiveHandler(emitted_packets=[emitted_packet])
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[DummyRtcpReceiveComponent(handler)],
+        )
+        sent_rtcp: list[bytes] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_rtcp.append(data)
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtcpRrPacket(ssrc=1234)
+        await session._handle_rtcp_data(bytes(packet))
+
+        self.assertEqual(len(handler.packets), 1)
+        self.assertEqual(handler.packets[0], packet)
+        self.assertEqual(len(handler.now_us), 1)
+        self.assertGreater(handler.now_us[0], 0)
+        self.assertEqual(sent_rtcp, [bytes(emitted_packet)])
 
     @asynctest
     async def test_rtp_malformed(self) -> None:

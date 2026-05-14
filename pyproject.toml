@@ -31,6 +31,7 @@ dependencies = [
     "google-crc32c>=1.1",
     "pyee>=13.0.0",
     "pycc",
+    "pyRTCP",
     "pylibsrtp>=0.10.0",
     "pyopenssl>=25.0.0",
     "rtc-types",
@@ -77,6 +78,7 @@ known-third-party = ["aiortc"]
 
 [tool.uv.sources]
 pycc = { git = "ssh://git@github.com/Weave-Robotics/pycc.git", rev = "main" }
+pyRTCP = { git = "ssh://git@github.com/Weave-Robotics/pyrtcp.git", rev = "main" }
 rtc-types = { git = "ssh://git@github.com/Weave-Robotics/rtc-types.git", rev = "main" }
 
 [tool.setuptools.dynamic]

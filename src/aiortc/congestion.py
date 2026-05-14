@@ -14,15 +14,19 @@ from pycc import (
     TransportControlSentPacket,
     TransportControlTelemetry,
 )
+from rtc_types import RtcpReceiveContext
 
 from . import clock
 from .rtp import (
     RTCP_PSFB_APP,
+    RTCP_RTPFB,
+    RTCP_RTPFB_TRANSPORT_CC,
     AnyRtcpPacket,
     RtcpPsfbPacket,
     RtcpTransportLayerCcPacket,
     RtpPacket,
     pack_remb_fci,
+    unpack_remb_fci,
 )
 from .transporttrace import NetTraceWriter
 
@@ -319,6 +323,28 @@ class TransportCongestionController:
                 allocations=self.__sender_trace_allocations(),
             )
 
+    def on_rtcp_received(
+        self, packet: object, context: RtcpReceiveContext
+    ) -> list[object]:
+        if (
+            isinstance(packet, RtcpTransportLayerCcPacket)
+            or (
+                getattr(packet, "packet_type", None) == RTCP_RTPFB
+                and getattr(packet, "fmt", None) == RTCP_RTPFB_TRANSPORT_CC
+            )
+        ):
+            self.handle_transport_feedback(packet, context.now_us)
+            return []
+
+        if isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_APP:
+            try:
+                bitrate, ssrcs = unpack_remb_fci(packet.fci)
+            except ValueError:
+                pass
+            else:
+                self.update_receiver_estimate(bitrate, ssrcs, context.now_ms)
+        return []
+
     def set_rtt(self, rtt_ms: int) -> None:
         if rtt_ms <= 0:
             return
@@ -380,11 +406,12 @@ class TransportCongestionController:
         state.encoded_payload_bytes += payload_bytes
 
     def handle_transport_feedback(
-        self, packet: RtcpTransportLayerCcPacket, now_us: int
+        self, packet: RtcpTransportLayerCcPacket | Any, now_us: int
     ) -> None:
         previous_target = self.__transport_control.get_target_bitrate()
+        feedback = getattr(packet, "feedback", packet)
         update = self.__transport_control.handle_transport_feedback(
-            packet.feedback, now_us
+            feedback, now_us
         )
         if update is not None:
             self.__recompute_allocation()

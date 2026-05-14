@@ -17,6 +17,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from OpenSSL import SSL
 from pyee.asyncio import AsyncIOEventEmitter
 from pylibsrtp import Policy, Session
+from pyrtcp import RtcpPacketRegistry
+from rtc_types import RtcpReceiveContext, RtcpReceiveObserver
 
 from . import clock, rtp
 from .congestion import TransportCongestionController
@@ -410,9 +412,25 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue: deque[_QueuedRtpPacket] = deque()
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
+        congestion_control_components = tuple(congestion_control or ())
+        self._rtcp_packet_registry = RtcpPacketRegistry()
+        for component in congestion_control_components:
+            rtcp_codecs = getattr(component, "rtcp_codecs", None)
+            if rtcp_codecs is None:
+                continue
+            for codec in rtcp_codecs():
+                self._rtcp_packet_registry.register(codec)
         self._congestion_controller = TransportCongestionController(
-            congestion_control
+            congestion_control_components
         )
+        self._rtcp_receive_handlers: list[RtcpReceiveObserver] = [
+            self._congestion_controller
+        ]
+        for component in congestion_control_components:
+            rtcp_receive_handlers = getattr(component, "rtcp_receive_handlers", None)
+            if rtcp_receive_handlers is None:
+                continue
+            self._rtcp_receive_handlers.extend(rtcp_receive_handlers())
         self._rtp_pacer_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
@@ -657,25 +675,20 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     async def _handle_rtcp_data(self, data: bytes) -> None:
         try:
-            packets = RtcpPacket.parse(data)
+            packets = RtcpPacket.parse(data, self._rtcp_packet_registry)
         except ValueError as exc:
             self.__log_debug("x RTCP parsing failed: %s", exc)
             return
 
+        context = RtcpReceiveContext(now_us=clock.current_monotonic_us())
         for packet in packets:
-            if isinstance(packet, rtp.RtcpTransportLayerCcPacket):
-                self._congestion_controller.handle_transport_feedback(
-                    packet, clock.current_monotonic_us()
-                )
-            if isinstance(packet, RtcpPsfbPacket) and packet.fmt == rtp.RTCP_PSFB_APP:
-                try:
-                    bitrate, ssrcs = rtp.unpack_remb_fci(packet.fci)
-                except ValueError:
-                    pass
-                else:
-                    self._congestion_controller.update_receiver_estimate(
-                        bitrate, ssrcs, clock.current_ms()
-                    )
+            for handler in self._rtcp_receive_handlers:
+                feedback_packets = handler.on_rtcp_received(packet, context)
+                for feedback_packet in feedback_packets:
+                    try:
+                        await self._send_rtp(bytes(feedback_packet))
+                    except ConnectionError:
+                        pass
             # route RTCP packet
             for recipient in self._rtp_router.route_rtcp(packet):
                 await recipient._handle_rtcp_packet(packet)

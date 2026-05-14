@@ -26,7 +26,8 @@ from aiortc.rtp import (
     wrap_rtx,
 )
 from av import AudioFrame
-from pycc import TransportLayerCcPacket, TwccPacketStatus
+from pycc import TransportLayerCcPacket, TwccPacketStatus, TwccRtcpCodec
+from pyrtcp import RtcpPacketRegistry
 
 from .utils import TestCase, load
 
@@ -52,6 +53,9 @@ def create_audio_frame(
 
 
 class RtcpPacketTest(TestCase):
+    def twcc_registry(self) -> RtcpPacketRegistry:
+        return RtcpPacketRegistry([TwccRtcpCodec()])
+
     def test_bye(self) -> None:
         data = load("rtcp_bye.bin")
         packets = RtcpPacket.parse(data)
@@ -242,13 +246,13 @@ class RtcpPacketTest(TestCase):
         )
         packet = RtcpTransportLayerCcPacket(feedback=feedback)
 
-        packets = RtcpPacket.parse(bytes(packet))
+        packets = RtcpPacket.parse(bytes(packet), self.twcc_registry())
 
-        parsed = self.ensureIsInstance(packets[0], RtcpTransportLayerCcPacket)
+        parsed = self.ensureIsInstance(packets[0], TransportLayerCcPacket)
         self.assertEqual(parsed.fmt, rtp.RTCP_RTPFB_TRANSPORT_CC)
         self.assertEqual(parsed.ssrc, 1234)
         self.assertEqual(parsed.media_ssrc, 5678)
-        self.assertEqual(parsed.feedback.packets, feedback.packets)
+        self.assertEqual(parsed.packets, feedback.packets)
         self.assertEqual(bytes(parsed), bytes(packet))
 
     def test_rtpfb_transport_cc_incoming_fmt_15_golden_vector(self) -> None:
@@ -256,16 +260,16 @@ class RtcpPacketTest(TestCase):
             "afcd000711111111222222220bb8000700000305d891010118fffc0002000003"
         )
 
-        packets = RtcpPacket.parse(data)
+        packets = RtcpPacket.parse(data, self.twcc_registry())
 
-        parsed = self.ensureIsInstance(packets[0], RtcpTransportLayerCcPacket)
+        parsed = self.ensureIsInstance(packets[0], TransportLayerCcPacket)
         self.assertEqual(parsed.fmt, 15)
         self.assertEqual(parsed.ssrc, 0x11111111)
         self.assertEqual(parsed.media_ssrc, 0x22222222)
-        self.assertEqual(parsed.feedback.base_sequence_number, 3000)
-        self.assertEqual(parsed.feedback.feedback_packet_count, 5)
+        self.assertEqual(parsed.base_sequence_number, 3000)
+        self.assertEqual(parsed.feedback_packet_count, 5)
         self.assertEqual(
-            parsed.feedback.packets,
+            parsed.packets,
             [
                 TwccPacketStatus(3000, 250),
                 TwccPacketStatus(3001, 70_000),

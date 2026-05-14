@@ -6,12 +6,17 @@ from struct import pack, unpack, unpack_from
 from typing import Any, Optional, Union
 
 from av import AudioFrame
-from pycc import (
-    RTPFB_TRANSPORT_CC_FMT,
-    TRANSPORT_CC_URI,
-    TransportLayerCcPacket,
-    parse_transport_layer_cc,
-    serialize_transport_layer_cc,
+from pyrtcp import (
+    Goodbye,
+    ReceiverReport,
+    ReceptionReportBlock,
+    RtcpHeader,
+    RtcpPacketRegistry,
+    SdesChunk,
+    SdesItem,
+    SenderInfo,
+    SenderReport,
+    SourceDescription,
 )
 
 from .rtcrtpparameters import RTCRtpParameters
@@ -37,13 +42,17 @@ RTCP_RTPFB = 205
 RTCP_PSFB = 206
 
 RTCP_RTPFB_NACK = 1
-RTCP_RTPFB_TRANSPORT_CC = RTPFB_TRANSPORT_CC_FMT
+RTCP_RTPFB_TRANSPORT_CC = 15
 
 RTCP_PSFB_PLI = 1
 RTCP_PSFB_SLI = 2
 RTCP_PSFB_RPSI = 3
 RTCP_PSFB_FIR = 4
 RTCP_PSFB_APP = 15
+
+TRANSPORT_CC_URI = (
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+)
 
 
 @dataclass
@@ -353,25 +362,31 @@ class RtcpReceiverInfo:
     lsr: int
     dlsr: int
 
+    def _to_pyrtcp(self) -> ReceptionReportBlock:
+        return ReceptionReportBlock(
+            ssrc=self.ssrc,
+            fraction_lost=self.fraction_lost,
+            packets_lost=self.packets_lost,
+            highest_sequence=self.highest_sequence,
+            jitter=self.jitter,
+            lsr=self.lsr,
+            dlsr=self.dlsr,
+        )
+
     def __bytes__(self) -> bytes:
-        data = pack("!LB", self.ssrc, self.fraction_lost)
-        data += pack_packets_lost(self.packets_lost)
-        data += pack("!LLLL", self.highest_sequence, self.jitter, self.lsr, self.dlsr)
-        return data
+        return self._to_pyrtcp().serialize()
 
     @classmethod
     def parse(cls, data: bytes) -> "RtcpReceiverInfo":
-        ssrc, fraction_lost = unpack("!LB", data[0:5])
-        packets_lost = unpack_packets_lost(data[5:8])
-        highest_sequence, jitter, lsr, dlsr = unpack("!LLLL", data[8:])
+        report = ReceptionReportBlock.parse(data)
         return cls(
-            ssrc=ssrc,
-            fraction_lost=fraction_lost,
-            packets_lost=packets_lost,
-            highest_sequence=highest_sequence,
-            jitter=jitter,
-            lsr=lsr,
-            dlsr=dlsr,
+            ssrc=report.ssrc,
+            fraction_lost=report.fraction_lost,
+            packets_lost=report.packets_lost,
+            highest_sequence=report.highest_sequence,
+            jitter=report.jitter,
+            lsr=report.lsr,
+            dlsr=report.dlsr,
         )
 
 
@@ -382,23 +397,29 @@ class RtcpSenderInfo:
     packet_count: int
     octet_count: int
 
-    def __bytes__(self) -> bytes:
-        return pack(
-            "!QLLL",
-            self.ntp_timestamp,
-            self.rtp_timestamp,
-            self.packet_count,
-            self.octet_count,
+    def _to_pyrtcp(self) -> SenderInfo:
+        return SenderInfo(
+            ntp_timestamp_msw=(self.ntp_timestamp >> 32) & 0xFFFFFFFF,
+            ntp_timestamp_lsw=self.ntp_timestamp & 0xFFFFFFFF,
+            rtp_timestamp=self.rtp_timestamp,
+            packet_count=self.packet_count,
+            octet_count=self.octet_count,
         )
+
+    def __bytes__(self) -> bytes:
+        return self._to_pyrtcp().serialize()
 
     @classmethod
     def parse(cls, data: bytes) -> "RtcpSenderInfo":
-        ntp_timestamp, rtp_timestamp, packet_count, octet_count = unpack("!QLLL", data)
+        sender_info = SenderInfo.parse(data)
         return cls(
-            ntp_timestamp=ntp_timestamp,
-            rtp_timestamp=rtp_timestamp,
-            packet_count=packet_count,
-            octet_count=octet_count,
+            ntp_timestamp=(
+                (sender_info.ntp_timestamp_msw << 32)
+                | sender_info.ntp_timestamp_lsw
+            ),
+            rtp_timestamp=sender_info.rtp_timestamp,
+            packet_count=sender_info.packet_count,
+            octet_count=sender_info.octet_count,
         )
 
 
@@ -407,24 +428,36 @@ class RtcpSourceInfo:
     ssrc: int
     items: list[tuple[Any, bytes]]
 
+    def _to_pyrtcp(self) -> SdesChunk:
+        return SdesChunk(
+            ssrc=self.ssrc,
+            items=[
+                SdesItem(item_type=int(item_type), value=item_value)
+                for item_type, item_value in self.items
+            ],
+        )
+
 
 @dataclass
 class RtcpByePacket:
     sources: list[int]
 
     def __bytes__(self) -> bytes:
-        payload = b"".join([pack("!L", ssrc) for ssrc in self.sources])
-        return pack_rtcp_packet(RTCP_BYE, len(self.sources), payload)
+        return Goodbye(sources=self.sources).serialize()
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpByePacket":
         if len(data) < 4 * count:
             raise ValueError("RTCP bye length is invalid")
-        if count > 0:
-            sources = list(unpack_from("!" + ("L" * count), data, 0))
-        else:
-            sources = []
-        return cls(sources=sources)
+        bye = Goodbye.parse(
+            header=RtcpHeader.for_payload(
+                packet_type=RTCP_BYE,
+                count=count,
+                payload_size_bytes=len(data),
+            ),
+            payload=data,
+        )
+        return cls(sources=bye.sources)
 
 
 @dataclass
@@ -458,23 +491,39 @@ class RtcpRrPacket:
     reports: list[RtcpReceiverInfo] = field(default_factory=list)
 
     def __bytes__(self) -> bytes:
-        payload = pack("!L", self.ssrc)
-        for report in self.reports:
-            payload += bytes(report)
-        return pack_rtcp_packet(RTCP_RR, len(self.reports), payload)
+        return ReceiverReport(
+            ssrc=self.ssrc,
+            reports=[report._to_pyrtcp() for report in self.reports],
+        ).serialize()
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpRrPacket":
         if len(data) != 4 + 24 * count:
             raise ValueError("RTCP receiver report length is invalid")
 
-        ssrc = unpack("!L", data[0:4])[0]
-        pos = 4
-        reports = []
-        for r in range(count):
-            reports.append(RtcpReceiverInfo.parse(data[pos : pos + 24]))
-            pos += 24
-        return cls(ssrc=ssrc, reports=reports)
+        report = ReceiverReport.parse(
+            header=RtcpHeader.for_payload(
+                packet_type=RTCP_RR,
+                count=count,
+                payload_size_bytes=len(data),
+            ),
+            payload=data,
+        )
+        return cls(
+            ssrc=report.ssrc,
+            reports=[
+                RtcpReceiverInfo(
+                    ssrc=block.ssrc,
+                    fraction_lost=block.fraction_lost,
+                    packets_lost=block.packets_lost,
+                    highest_sequence=block.highest_sequence,
+                    jitter=block.jitter,
+                    lsr=block.lsr,
+                    dlsr=block.dlsr,
+                )
+                for block in report.reports
+            ],
+        )
 
 
 @dataclass
@@ -528,7 +577,7 @@ class RtcpTransportLayerCcPacket:
     Transport-wide congestion-control feedback (draft-holmer transport-cc).
     """
 
-    feedback: TransportLayerCcPacket
+    feedback: Any
 
     @property
     def fmt(self) -> int:
@@ -543,18 +592,7 @@ class RtcpTransportLayerCcPacket:
         return self.feedback.media_ssrc
 
     def __bytes__(self) -> bytes:
-        return serialize_transport_layer_cc(self.feedback)
-
-    @classmethod
-    def parse(cls, data: bytes, fmt: int) -> "RtcpTransportLayerCcPacket":
-        if fmt != RTCP_RTPFB_TRANSPORT_CC:
-            raise ValueError("RTCP RTP feedback type is not transport-cc")
-        if len(data) < 16:
-            raise ValueError("RTCP transport feedback length is invalid")
-        data += b"\x00" * padl(len(data))
-        return cls(
-            feedback=parse_transport_layer_cc(pack_rtcp_packet(RTCP_RTPFB, fmt, data))
-        )
+        return bytes(self.feedback)
 
 
 @dataclass
@@ -562,41 +600,40 @@ class RtcpSdesPacket:
     chunks: list[RtcpSourceInfo] = field(default_factory=list)
 
     def __bytes__(self) -> bytes:
-        payload = b""
-        for chunk in self.chunks:
-            payload += pack("!L", chunk.ssrc)
-            for d_type, d_value in chunk.items:
-                payload += pack("!BB", d_type, len(d_value)) + d_value
-            payload += b"\x00\x00"
-        while len(payload) % 4:
-            payload += b"\x00"
-        return pack_rtcp_packet(RTCP_SDES, len(self.chunks), payload)
+        return SourceDescription(
+            chunks=[chunk._to_pyrtcp() for chunk in self.chunks]
+        ).serialize()
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpSdesPacket":
-        pos = 0
-        chunks = []
-        for r in range(count):
-            if len(data) < pos + 4:
-                raise ValueError("RTCP SDES source is truncated")
-            ssrc = unpack_from("!L", data, pos)[0]
-            pos += 4
-
-            items = []
-            while pos < len(data) - 1:
-                d_type, d_length = unpack_from("!BB", data, pos)
-                pos += 2
-
-                if len(data) < pos + d_length:
-                    raise ValueError("RTCP SDES item is truncated")
-                d_value = data[pos : pos + d_length]
-                pos += d_length
-                if d_type == 0:
-                    break
-                else:
-                    items.append((d_type, d_value))
-            chunks.append(RtcpSourceInfo(ssrc=ssrc, items=items))
-        return cls(chunks=chunks)
+        try:
+            sdes = SourceDescription.parse(
+                header=RtcpHeader.for_payload(
+                    packet_type=RTCP_SDES,
+                    count=count,
+                    payload_size_bytes=len(data),
+                ),
+                payload=data,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if message == "SDES chunk is truncated":
+                raise ValueError("RTCP SDES source is truncated") from exc
+            if message.startswith("SDES item"):
+                raise ValueError("RTCP SDES item is truncated") from exc
+            raise
+        return cls(
+            chunks=[
+                RtcpSourceInfo(
+                    ssrc=chunk.ssrc,
+                    items=[
+                        (item.item_type, item.value)
+                        for item in chunk.items
+                    ],
+                )
+                for chunk in sdes.chunks
+            ]
+        )
 
 
 @dataclass
@@ -606,25 +643,49 @@ class RtcpSrPacket:
     reports: list[RtcpReceiverInfo] = field(default_factory=list)
 
     def __bytes__(self) -> bytes:
-        payload = pack("!L", self.ssrc)
-        payload += bytes(self.sender_info)
-        for report in self.reports:
-            payload += bytes(report)
-        return pack_rtcp_packet(RTCP_SR, len(self.reports), payload)
+        return SenderReport(
+            ssrc=self.ssrc,
+            sender_info=self.sender_info._to_pyrtcp(),
+            reports=[report._to_pyrtcp() for report in self.reports],
+        ).serialize()
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpSrPacket":
         if len(data) != 24 + 24 * count:
             raise ValueError("RTCP sender report length is invalid")
 
-        ssrc = unpack_from("!L", data)[0]
-        sender_info = RtcpSenderInfo.parse(data[4:24])
-        pos = 24
-        reports = []
-        for r in range(count):
-            reports.append(RtcpReceiverInfo.parse(data[pos : pos + 24]))
-            pos += 24
-        return RtcpSrPacket(ssrc=ssrc, sender_info=sender_info, reports=reports)
+        report = SenderReport.parse(
+            header=RtcpHeader.for_payload(
+                packet_type=RTCP_SR,
+                count=count,
+                payload_size_bytes=len(data),
+            ),
+            payload=data,
+        )
+        return RtcpSrPacket(
+            ssrc=report.ssrc,
+            sender_info=RtcpSenderInfo(
+                ntp_timestamp=(
+                    (report.sender_info.ntp_timestamp_msw << 32)
+                    | report.sender_info.ntp_timestamp_lsw
+                ),
+                rtp_timestamp=report.sender_info.rtp_timestamp,
+                packet_count=report.sender_info.packet_count,
+                octet_count=report.sender_info.octet_count,
+            ),
+            reports=[
+                RtcpReceiverInfo(
+                    ssrc=block.ssrc,
+                    fraction_lost=block.fraction_lost,
+                    packets_lost=block.packets_lost,
+                    highest_sequence=block.highest_sequence,
+                    jitter=block.jitter,
+                    lsr=block.lsr,
+                    dlsr=block.dlsr,
+                )
+                for block in report.reports
+            ],
+        )
 
 
 AnyRtcpPacket = Union[
@@ -640,7 +701,11 @@ AnyRtcpPacket = Union[
 
 class RtcpPacket:
     @classmethod
-    def parse(cls, data: bytes) -> list[AnyRtcpPacket]:
+    def parse(
+        cls,
+        data: bytes,
+        rtcp_registry: RtcpPacketRegistry | None = None,
+    ) -> list[AnyRtcpPacket]:
         pos = 0
         packets: list[AnyRtcpPacket] = []
 
@@ -664,10 +729,30 @@ class RtcpPacket:
             payload = data[pos:end]
             pos = end
 
+            padding_bytes = b""
             if padding:
                 if not payload or not payload[-1] or payload[-1] > len(payload):
                     raise ValueError("RTCP packet padding length is invalid")
+                padding_bytes = payload[-payload[-1] :]
                 payload = payload[0 : -payload[-1]]
+
+            codec = None
+            if rtcp_registry is not None:
+                codec = rtcp_registry.codec_for(packet_type, count)
+            if codec is not None:
+                packets.append(
+                    codec.parse_rtcp(
+                        header=RtcpHeader(
+                            count=count,
+                            packet_type=packet_type,
+                            length=length,
+                            padding=bool(padding),
+                        ),
+                        payload=payload,
+                        padding=padding_bytes,
+                    )
+                )
+                continue
 
             if packet_type == RTCP_BYE:
                 packets.append(RtcpByePacket.parse(payload, count))
@@ -678,10 +763,7 @@ class RtcpPacket:
             elif packet_type == RTCP_RR:
                 packets.append(RtcpRrPacket.parse(payload, count))
             elif packet_type == RTCP_RTPFB:
-                if count == RTCP_RTPFB_TRANSPORT_CC:
-                    packets.append(RtcpTransportLayerCcPacket.parse(payload, count))
-                else:
-                    packets.append(RtcpRtpfbPacket.parse(payload, count))
+                packets.append(RtcpRtpfbPacket.parse(payload, count))
             elif packet_type == RTCP_PSFB:
                 packets.append(RtcpPsfbPacket.parse(payload, count))
 
