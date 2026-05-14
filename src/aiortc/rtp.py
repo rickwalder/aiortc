@@ -1,7 +1,7 @@
 import math
 import struct
 from dataclasses import dataclass, field
-from struct import pack, unpack, unpack_from
+from struct import pack, unpack
 from typing import Any, Optional, Union
 
 from av import AudioFrame
@@ -16,6 +16,12 @@ from pyrtcp import (
     SenderInfo,
     SenderReport,
     SourceDescription,
+)
+from pyrtcp import (
+    pack_remb_fci as pack_wire_remb_fci,
+)
+from pyrtcp import (
+    unpack_remb_fci as unpack_wire_remb_fci,
 )
 from pyrtp import (
     HeaderExtensionElement,
@@ -209,18 +215,7 @@ def pack_remb_fci(bitrate: int, ssrcs: list[int]) -> bytes:
 
     https://tools.ietf.org/html/draft-alvestrand-rmcat-remb-03
     """
-    data = b"REMB"
-    exponent = 0
-    mantissa = bitrate
-    while mantissa > 0x3FFFF:
-        mantissa >>= 1
-        exponent += 1
-    data += pack(
-        "!BBH", len(ssrcs), (exponent << 2) | (mantissa >> 16), (mantissa & 0xFFFF)
-    )
-    for ssrc in ssrcs:
-        data += pack("!L", ssrc)
-    return data
+    return pack_wire_remb_fci(bitrate, ssrcs)
 
 
 def unpack_remb_fci(data: bytes) -> tuple[int, list[int]]:
@@ -229,20 +224,7 @@ def unpack_remb_fci(data: bytes) -> tuple[int, list[int]]:
 
     https://tools.ietf.org/html/draft-alvestrand-rmcat-remb-03
     """
-    if len(data) < 8 or data[0:4] != b"REMB":
-        raise ValueError("Invalid REMB prefix")
-
-    exponent = (data[5] & 0xFC) >> 2
-    mantissa = ((data[5] & 0x03) << 16) | (data[6] << 8) | data[7]
-    bitrate = mantissa << exponent
-
-    pos = 8
-    ssrcs = []
-    for r in range(data[4]):
-        ssrcs.append(unpack_from("!L", data, pos)[0])
-        pos += 4
-
-    return (bitrate, ssrcs)
+    return unpack_wire_remb_fci(data)
 
 
 def is_rtcp(msg: bytes) -> bool:
