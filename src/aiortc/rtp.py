@@ -1,5 +1,4 @@
 import math
-import os
 import struct
 from dataclasses import dataclass, field
 from struct import pack, unpack, unpack_from
@@ -18,7 +17,21 @@ from pyrtcp import (
     SenderReport,
     SourceDescription,
 )
-from pyrtp import unwrap_rtx_payload, wrap_rtx_payload
+from pyrtp import (
+    HeaderExtensionElement,
+    RtpError,
+    unwrap_rtx_payload,
+    wrap_rtx_payload,
+)
+from pyrtp import (
+    RtpPacket as WireRtpPacket,
+)
+from pyrtp import (
+    parse_header_extensions as parse_wire_header_extensions,
+)
+from pyrtp import (
+    serialize_header_extensions as serialize_wire_header_extensions,
+)
 
 from .rtcrtpparameters import RTCRtpParameters
 
@@ -244,90 +257,40 @@ def padl(length: int) -> int:
 
 
 def unpack_header_extensions(
-    extension_profile: int, extension_value: bytes
+    extension_profile: int, extension_value: bytes | None
 ) -> list[tuple[int, bytes]]:
     """
     Parse header extensions according to RFC 5285.
     """
-    extensions = []
-    pos = 0
-
-    if extension_profile == 0xBEDE:
-        # One-Byte Header
-        while pos < len(extension_value):
-            # skip padding byte
-            if extension_value[pos] == 0:
-                pos += 1
-                continue
-
-            x_id = (extension_value[pos] & 0xF0) >> 4
-            x_length = (extension_value[pos] & 0x0F) + 1
-            pos += 1
-
-            if len(extension_value) < pos + x_length:
-                raise ValueError("RTP one-byte header extension value is truncated")
-            x_value = extension_value[pos : pos + x_length]
-            extensions.append((x_id, x_value))
-            pos += x_length
-    elif extension_profile == 0x1000:
-        # Two-Byte Header
-        while pos < len(extension_value):
-            # skip padding byte
-            if extension_value[pos] == 0:
-                pos += 1
-                continue
-
-            if len(extension_value) < pos + 2:
-                raise ValueError("RTP two-byte header extension is truncated")
-            x_id, x_length = unpack_from("!BB", extension_value, pos)
-            pos += 2
-
-            if len(extension_value) < pos + x_length:
-                raise ValueError("RTP two-byte header extension value is truncated")
-            x_value = extension_value[pos : pos + x_length]
-            extensions.append((x_id, x_value))
-            pos += x_length
-
-    return extensions
+    if extension_value is None:
+        return []
+    try:
+        return [
+            (element.identifier, element.value)
+            for element in parse_wire_header_extensions(
+                extension_profile, extension_value
+            )
+        ]
+    except RtpError as exc:
+        message = str(exc)
+        if message == "RTP two-byte header extension length is truncated":
+            message = "RTP two-byte header extension is truncated"
+        raise ValueError(message) from exc
 
 
 def pack_header_extensions(extensions: list[tuple[int, bytes]]) -> tuple[int, bytes]:
     """
     Serialize header extensions according to RFC 5285.
     """
-    extension_profile = 0
-    extension_value = b""
-
-    if not extensions:
-        return extension_profile, extension_value
-
-    one_byte = True
-    for x_id, x_value in extensions:
-        x_length = len(x_value)
-        assert x_id > 0 and x_id < 256
-        assert x_length >= 0 and x_length < 256
-        if x_id > 14 or x_length == 0 or x_length > 16:
-            one_byte = False
-
-    if one_byte:
-        # One-Byte Header
-        extension_profile = 0xBEDE
-        extension_value = b""
-        for x_id, x_value in extensions:
-            x_length = len(x_value)
-            extension_value += pack("!B", (x_id << 4) | (x_length - 1))
-            extension_value += x_value
-    else:
-        # Two-Byte Header
-        extension_profile = 0x1000
-        extension_value = b""
-        for x_id, x_value in extensions:
-            x_length = len(x_value)
-            extension_value += pack("!BB", x_id, x_length)
-            extension_value += x_value
-
-    extension_value += b"\x00" * padl(len(extension_value))
-    return extension_profile, extension_value
+    try:
+        return serialize_wire_header_extensions(
+            [
+                HeaderExtensionElement(identifier=x_id, value=x_value)
+                for x_id, x_value in extensions
+            ]
+        )
+    except RtpError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def compute_audio_level_dbov(frame: AudioFrame) -> int:
@@ -808,50 +771,24 @@ class RtpPacket:
                 f"RTP packet length is less than {RTP_HEADER_LENGTH} bytes"
             )
 
-        v_p_x_cc, m_pt, sequence_number, timestamp, ssrc = unpack("!BBHLL", data[0:12])
-        version = v_p_x_cc >> 6
-        padding = (v_p_x_cc >> 5) & 1
-        extension = (v_p_x_cc >> 4) & 1
-        cc = v_p_x_cc & 0x0F
-        if version != 2:
-            raise ValueError("RTP packet has invalid version")
-        if len(data) < RTP_HEADER_LENGTH + 4 * cc:
-            raise ValueError("RTP packet has truncated CSRC")
+        try:
+            wire_packet = WireRtpPacket.parse(data)
+        except RtpError as exc:
+            raise ValueError(cls.__wire_parse_error_message(data, exc)) from exc
 
         packet = cls(
-            marker=(m_pt >> 7),
-            payload_type=(m_pt & 0x7F),
-            sequence_number=sequence_number,
-            timestamp=timestamp,
-            ssrc=ssrc,
+            marker=int(wire_packet.marker),
+            payload_type=wire_packet.payload_type,
+            sequence_number=wire_packet.sequence_number,
+            timestamp=wire_packet.timestamp,
+            ssrc=wire_packet.ssrc,
+            payload=wire_packet.payload,
         )
-
-        pos = RTP_HEADER_LENGTH
-        for i in range(0, cc):
-            packet.csrc.append(unpack_from("!L", data, pos)[0])
-            pos += 4
-
-        if extension:
-            if len(data) < pos + 4:
-                raise ValueError("RTP packet has truncated extension profile / length")
-            extension_profile, extension_length = unpack_from("!HH", data, pos)
-            extension_length *= 4
-            pos += 4
-
-            if len(data) < pos + extension_length:
-                raise ValueError("RTP packet has truncated extension value")
-            extension_value = data[pos : pos + extension_length]
-            pos += extension_length
-            packet.extensions = extensions_map.get(extension_profile, extension_value)
-
-        if padding:
-            padding_len = data[-1]
-            if not padding_len or padding_len > len(data) - pos:
-                raise ValueError("RTP packet padding length is invalid")
-            packet.padding_size = padding_len
-            packet.payload = data[pos:-padding_len]
-        else:
-            packet.payload = data[pos:]
+        packet.csrc = wire_packet.csrc
+        packet.padding_size = wire_packet.padding_size
+        packet.extensions = extensions_map.get(
+            wire_packet.extension_profile, wire_packet.extension_value
+        )
 
         return packet
 
@@ -859,30 +796,40 @@ class RtpPacket:
         self, extensions_map: HeaderExtensionsMap = HeaderExtensionsMap()
     ) -> bytes:
         extension_profile, extension_value = extensions_map.set(self.extensions)
-        has_extension = bool(extension_value)
+        try:
+            return bytes(
+                WireRtpPacket(
+                    payload_type=self.payload_type,
+                    marker=bool(self.marker),
+                    sequence_number=self.sequence_number,
+                    timestamp=self.timestamp,
+                    ssrc=self.ssrc,
+                    csrc=self.csrc,
+                    extension_profile=extension_profile,
+                    extension_value=extension_value,
+                    payload=self.payload,
+                    padding_size=self.padding_size,
+                )
+            )
+        except RtpError as exc:
+            raise ValueError(str(exc)) from exc
 
-        padding = self.padding_size > 0
-        data = pack(
-            "!BBHLL",
-            (self.version << 6)
-            | (padding << 5)
-            | (has_extension << 4)
-            | len(self.csrc),
-            (self.marker << 7) | self.payload_type,
-            self.sequence_number,
-            self.timestamp,
-            self.ssrc,
-        )
-        for csrc in self.csrc:
-            data += pack("!L", csrc)
-        if has_extension:
-            data += pack("!HH", extension_profile, len(extension_value) >> 2)
-            data += extension_value
-        data += self.payload
-        if padding:
-            data += os.urandom(self.padding_size - 1)
-            data += bytes([self.padding_size])
-        return data
+    @staticmethod
+    def __wire_parse_error_message(data: bytes, exc: RtpError) -> str:
+        message = str(exc)
+        if message == "RTP packet has invalid version":
+            return message
+        if message == "RTP padding length is invalid":
+            return "RTP packet padding length is invalid"
+        if len(data) >= RTP_HEADER_LENGTH:
+            csrc_count = data[0] & 0x0F
+            if len(data) < RTP_HEADER_LENGTH + 4 * csrc_count:
+                return "RTP packet has truncated CSRC"
+        if message == "RTP header extension is truncated":
+            return "RTP packet has truncated extension profile / length"
+        if message == "RTP header extension value is truncated":
+            return "RTP packet has truncated extension value"
+        return message
 
 
 def unwrap_rtx(rtx: RtpPacket, payload_type: int, ssrc: int) -> RtpPacket:
