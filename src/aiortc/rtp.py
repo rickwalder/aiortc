@@ -18,6 +18,7 @@ from pyrtcp import (
     SenderReport,
     SourceDescription,
 )
+from pyrtp import unwrap_rtx_payload, wrap_rtx_payload
 
 from .rtcrtpparameters import RTCRtpParameters
 
@@ -888,13 +889,14 @@ def unwrap_rtx(rtx: RtpPacket, payload_type: int, ssrc: int) -> RtpPacket:
     """
     Recover initial packet from a retransmission packet.
     """
+    sequence_number, payload = unwrap_rtx_payload(rtx.payload)
     packet = RtpPacket(
         payload_type=payload_type,
         marker=rtx.marker,
-        sequence_number=unpack("!H", rtx.payload[0:2])[0],
+        sequence_number=sequence_number,
         timestamp=rtx.timestamp,
         ssrc=ssrc,
-        payload=rtx.payload[2:],
+        payload=payload,
     )
     packet.csrc = rtx.csrc
     packet.extensions = rtx.extensions
@@ -913,7 +915,7 @@ def wrap_rtx(
         sequence_number=sequence_number,
         timestamp=packet.timestamp,
         ssrc=ssrc,
-        payload=pack("!H", packet.sequence_number) + packet.payload,
+        payload=wrap_rtx_payload(packet.sequence_number, packet.payload),
     )
     rtx.csrc = packet.csrc
     rtx.extensions = packet.extensions

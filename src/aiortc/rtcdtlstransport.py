@@ -18,7 +18,16 @@ from OpenSSL import SSL
 from pyee.asyncio import AsyncIOEventEmitter
 from pylibsrtp import Policy, Session
 from pyrtcp import RtcpPacketRegistry
-from rtc_types import RtcpReceiveContext, RtcpReceiveObserver
+from rtc_types import (
+    RtcpReceiveContext,
+    RtcpReceiveObserver,
+    RtpReceiveContext,
+    RtpReceiveObserver,
+    RtpSendContext,
+    RtpSendInterceptor,
+    RtpSentContext,
+    RtpSentObserver,
+)
 
 from . import clock, rtp
 from .congestion import TransportCongestionController
@@ -426,11 +435,28 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtcp_receive_handlers: list[RtcpReceiveObserver] = [
             self._congestion_controller
         ]
+        self._rtp_send_interceptors: list[RtpSendInterceptor] = [
+            self._congestion_controller
+        ]
+        self._rtp_sent_observers: list[RtpSentObserver] = [
+            self._congestion_controller
+        ]
+        self._rtp_receive_observers: list[RtpReceiveObserver] = [
+            self._congestion_controller
+        ]
         for component in congestion_control_components:
             rtcp_receive_handlers = getattr(component, "rtcp_receive_handlers", None)
-            if rtcp_receive_handlers is None:
-                continue
-            self._rtcp_receive_handlers.extend(rtcp_receive_handlers())
+            if rtcp_receive_handlers is not None:
+                self._rtcp_receive_handlers.extend(rtcp_receive_handlers())
+            rtp_send_interceptors = getattr(component, "rtp_send_interceptors", None)
+            if rtp_send_interceptors is not None:
+                self._rtp_send_interceptors.extend(rtp_send_interceptors())
+            rtp_sent_observers = getattr(component, "rtp_sent_observers", None)
+            if rtp_sent_observers is not None:
+                self._rtp_sent_observers.extend(rtp_sent_observers())
+            rtp_receive_observers = getattr(component, "rtp_receive_observers", None)
+            if rtp_receive_observers is not None:
+                self._rtp_receive_observers.extend(rtp_receive_observers())
         self._rtp_pacer_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
@@ -703,14 +729,17 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         # route RTP packet
         receiver = self._rtp_router.route_rtp(packet)
         if receiver is not None:
-            feedback_packets = self._congestion_controller.observe_incoming_rtp(
-                receiver, packet, arrival_time_ms
+            context = RtpReceiveContext(
+                arrival_time_ms=arrival_time_ms,
+                receiver=receiver,
             )
-            for feedback_packet in feedback_packets:
-                try:
-                    await self._send_rtp(bytes(feedback_packet))
-                except ConnectionError:
-                    pass
+            for observer in self._rtp_receive_observers:
+                feedback_packets = observer.on_rtp_received(packet, context)
+                for feedback_packet in feedback_packets:
+                    try:
+                        await self._send_rtp(bytes(feedback_packet))
+                    except ConnectionError:
+                        pass
             await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
 
     async def _recv_next(self) -> None:
@@ -809,6 +838,53 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self.__tx_bytes += len(data)
         self.__tx_packets += 1
 
+    def _prepare_rtp_packet(
+        self,
+        packet: RtpPacket,
+        extensions_map: rtp.HeaderExtensionsMap,
+        *,
+        is_video: bool,
+        payload_size_bytes: int,
+        is_retransmission: bool,
+        is_probe: bool = False,
+    ) -> bool:
+        context = RtpSendContext(
+            now_us=clock.current_monotonic_us(),
+            is_video=is_video,
+            is_retransmission=is_retransmission,
+            is_probe=is_probe,
+            payload_size_bytes=payload_size_bytes,
+            supports_transport_sequence_number=(
+                extensions_map.has_transport_sequence_number
+            ),
+        )
+        for interceptor in self._rtp_send_interceptors:
+            decision = interceptor.prepare_rtp(packet, context)
+            if decision.drop_packet:
+                return False
+            if not decision.continue_pipeline:
+                break
+        return True
+
+    def _notify_rtp_sent(
+        self,
+        packet: RtpPacket,
+        *,
+        size_bytes: int,
+        payload_size_bytes: int,
+        is_retransmission: bool,
+        pacing_info: object | None = None,
+    ) -> None:
+        context = RtpSentContext(
+            send_time_us=clock.current_monotonic_us(),
+            size_bytes=size_bytes,
+            payload_size_bytes=payload_size_bytes,
+            is_retransmission=is_retransmission,
+            pacing_info=pacing_info,
+        )
+        for observer in self._rtp_sent_observers:
+            observer.on_rtp_sent(packet, context)
+
     async def _send_rtp_packet(
         self,
         packet: RtpPacket,
@@ -833,27 +909,29 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
-            packet_bytes = packet.serialize(extensions_map)
             if (
                 is_retransmission
                 and not self._congestion_controller.allow_retransmission(
-                    size_bytes=len(packet_bytes)
+                    size_bytes=len(packet.serialize(extensions_map))
                 )
             ):
                 return
+            if not self._prepare_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=is_video,
+                payload_size_bytes=payload_size_bytes,
+                is_retransmission=is_retransmission,
+            ):
+                return
+            packet_bytes = packet.serialize(extensions_map)
             await self._send_rtp(packet_bytes)
-
-            transport_sequence_number = packet.extensions.transport_sequence_number
-            if transport_sequence_number is not None:
-                self._congestion_controller.on_packet_sent(
-                    transport_sequence_number=transport_sequence_number,
-                    send_time_us=clock.current_monotonic_us(),
-                    size_bytes=len(packet_bytes),
-                    payload_size_bytes=payload_size_bytes,
-                    ssrc=packet.ssrc,
-                    rtp_sequence_number=packet.sequence_number,
-                    is_retransmission=is_retransmission,
-                )
+            self._notify_rtp_sent(
+                packet,
+                size_bytes=len(packet_bytes),
+                payload_size_bytes=payload_size_bytes,
+                is_retransmission=is_retransmission,
+            )
 
     async def _enqueue_rtp_packet(
         self,
@@ -874,10 +952,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 ):
                     return
 
-            if extensions_map.has_transport_sequence_number:
-                packet.extensions.transport_sequence_number = (
-                    self._congestion_controller.next_transport_sequence_number()
-                )
+            if not self._prepare_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=True,
+                payload_size_bytes=payload_size_bytes,
+                is_retransmission=is_retransmission,
+            ):
+                return
             packet_bytes = packet.serialize(extensions_map)
             queued = _QueuedRtpPacket(
                 packet=packet,
@@ -914,19 +996,13 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(queued.extensions_map)
             await self._send_rtp(packet_bytes)
-
-            transport_sequence_number = packet.extensions.transport_sequence_number
-            if transport_sequence_number is not None:
-                self._congestion_controller.on_packet_sent(
-                    transport_sequence_number=transport_sequence_number,
-                    send_time_us=clock.current_monotonic_us(),
-                    size_bytes=len(packet_bytes),
-                    payload_size_bytes=queued.payload_size_bytes,
-                    ssrc=packet.ssrc,
-                    rtp_sequence_number=packet.sequence_number,
-                    is_retransmission=queued.is_retransmission,
-                    pacing_info=pacing_info,
-                )
+            self._notify_rtp_sent(
+                packet,
+                size_bytes=len(packet_bytes),
+                payload_size_bytes=queued.payload_size_bytes,
+                is_retransmission=queued.is_retransmission,
+                pacing_info=pacing_info,
+            )
             return True
 
     def _update_rtp_queue_state(self) -> None:
@@ -1000,12 +1076,20 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             if not extensions_map.has_transport_sequence_number:
                 return False
 
-            packet.extensions.transport_sequence_number = (
-                self._congestion_controller.next_transport_sequence_number()
-            )
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
+            if not self._prepare_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=True,
+                payload_size_bytes=0,
+                is_retransmission=False,
+                is_probe=True,
+            ):
+                return False
+            if packet.extensions.transport_sequence_number is None:
+                return False
             packet_bytes = packet.serialize(extensions_map)
 
         pacing_info = await self._congestion_controller.pace_rtp_packet(
@@ -1020,16 +1104,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             ) & 0x00FFFFFF
             packet_bytes = packet.serialize(extensions_map)
             await self._send_rtp(packet_bytes)
-
-            transport_sequence_number = packet.extensions.transport_sequence_number
-            assert transport_sequence_number is not None
-            self._congestion_controller.on_packet_sent(
-                transport_sequence_number=transport_sequence_number,
-                send_time_us=clock.current_monotonic_us(),
+            self._notify_rtp_sent(
+                packet,
                 size_bytes=len(packet_bytes),
                 payload_size_bytes=0,
-                ssrc=packet.ssrc,
-                rtp_sequence_number=packet.sequence_number,
                 is_retransmission=False,
                 pacing_info=pacing_info,
             )

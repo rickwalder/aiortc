@@ -38,6 +38,7 @@ from aiortc.rtp import (
 )
 from OpenSSL import SSL
 from pycc import TRANSPORT_CC_URI, PacedPacketInfo, TransportCc, TransportLayerCcPacket
+from rtc_types import RtpSendDecision
 
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -76,6 +77,68 @@ class DummyRtcpReceiveComponent:
 
     def rtcp_receive_handlers(self) -> tuple[DummyRtcpReceiveHandler, ...]:
         return (self.handler,)
+
+
+class DummyRtpSendInterceptor:
+    def __init__(self) -> None:
+        self.packets: list[RtpPacket] = []
+        self.contexts: list[object] = []
+
+    def prepare_rtp(self, packet: RtpPacket, context: object) -> RtpSendDecision:
+        self.packets.append(packet)
+        self.contexts.append(context)
+        packet.payload += b"!"
+        return RtpSendDecision()
+
+
+class DummyRtpSentObserver:
+    def __init__(self) -> None:
+        self.packets: list[RtpPacket] = []
+        self.contexts: list[object] = []
+
+    def on_rtp_sent(self, packet: RtpPacket, context: object) -> None:
+        self.packets.append(packet)
+        self.contexts.append(context)
+
+
+class DummyRtpReceiveObserver:
+    def __init__(self, emitted_packets: list[AnyRtcpPacket] | None = None) -> None:
+        self.emitted_packets = emitted_packets or []
+        self.packets: list[RtpPacket] = []
+        self.contexts: list[object] = []
+
+    def on_rtp_received(self, packet: RtpPacket, context: object) -> list[object]:
+        self.packets.append(packet)
+        self.contexts.append(context)
+        return self.emitted_packets
+
+
+class DummyRtpComponent:
+    def __init__(
+        self,
+        *,
+        send_interceptor: DummyRtpSendInterceptor | None = None,
+        sent_observer: DummyRtpSentObserver | None = None,
+        receive_observer: DummyRtpReceiveObserver | None = None,
+    ) -> None:
+        self.send_interceptor = send_interceptor
+        self.sent_observer = sent_observer
+        self.receive_observer = receive_observer
+
+    def rtp_send_interceptors(self) -> tuple[DummyRtpSendInterceptor, ...]:
+        if self.send_interceptor is None:
+            return ()
+        return (self.send_interceptor,)
+
+    def rtp_sent_observers(self) -> tuple[DummyRtpSentObserver, ...]:
+        if self.sent_observer is None:
+            return ()
+        return (self.sent_observer,)
+
+    def rtp_receive_observers(self) -> tuple[DummyRtpReceiveObserver, ...]:
+        if self.receive_observer is None:
+            return ()
+        return (self.receive_observer,)
 
 
 class DummyRtpReceiver:
@@ -474,6 +537,45 @@ class RTCDtlsTransportTest(TestCase):
         session._congestion_controller.next_transport_sequence_number.assert_not_called()
 
     @asynctest
+    async def test_send_rtp_packet_invokes_send_handlers(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        send_interceptor = DummyRtpSendInterceptor()
+        sent_observer = DummyRtpSentObserver()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[
+                DummyRtpComponent(
+                    send_interceptor=send_interceptor,
+                    sent_observer=sent_observer,
+                )
+            ],
+        )
+        extensions_map = HeaderExtensionsMap()
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=False,
+            payload_size_bytes=len(packet.payload),
+        )
+
+        self.assertEqual(len(send_interceptor.packets), 1)
+        self.assertEqual(len(sent_observer.packets), 1)
+        self.assertEqual(sent_packets[0].payload, b"abc!")
+        self.assertEqual(sent_observer.contexts[0].payload_size_bytes, 3)
+
+    @asynctest
     async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(
@@ -624,6 +726,52 @@ class RTCDtlsTransportTest(TestCase):
             [packet.received for packet in feedback.packets],
             [False, True],
         )
+
+    @asynctest
+    async def test_handle_rtp_data_invokes_receive_handlers(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        emitted_packet = RtcpByePacket(sources=[7777])
+        receive_observer = DummyRtpReceiveObserver(emitted_packets=[emitted_packet])
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[
+                DummyRtpComponent(receive_observer=receive_observer)
+            ],
+        )
+        receiver = DummyRtpReceiver()
+        parameters = RTCRtpReceiveParameters(
+            codecs=[
+                RTCRtpCodecParameters(
+                    mimeType="video/VP8",
+                    clockRate=90000,
+                    payloadType=96,
+                )
+            ],
+            encodings=[RTCRtpDecodingParameters(ssrc=1234, payloadType=96)],
+        )
+        session._register_rtp_receiver(receiver, parameters)
+        sent_rtcp: list[bytes] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_rtcp.append(data)
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(
+            payload_type=96,
+            sequence_number=1000,
+            timestamp=123456,
+            ssrc=1234,
+            payload=b"abc",
+        )
+
+        await session._handle_rtp_data(packet.serialize(), 100)
+
+        self.assertEqual(len(receive_observer.packets), 1)
+        self.assertEqual(receive_observer.packets[0].payload, b"abc")
+        self.assertEqual(receive_observer.contexts[0].arrival_time_ms, 100)
+        self.assertEqual(sent_rtcp, [bytes(emitted_packet)])
 
     @asynctest
     async def test_handle_rtcp_data_invokes_receive_handlers(self) -> None:

@@ -14,7 +14,13 @@ from pycc import (
     TransportControlSentPacket,
     TransportControlTelemetry,
 )
-from rtc_types import RtcpReceiveContext
+from rtc_types import (
+    RtcpReceiveContext,
+    RtpReceiveContext,
+    RtpSendContext,
+    RtpSendDecision,
+    RtpSentContext,
+)
 
 from . import clock
 from .rtp import (
@@ -404,6 +410,51 @@ class TransportCongestionController:
         if state is None or payload_bytes <= 0:
             return
         state.encoded_payload_bytes += payload_bytes
+
+    def prepare_rtp(
+        self, packet: object, context: RtpSendContext
+    ) -> RtpSendDecision:
+        packet_extensions = getattr(packet, "extensions", None)
+        if (
+            context.is_video
+            and context.supports_transport_sequence_number
+            and getattr(
+                packet_extensions,
+                "transport_sequence_number",
+                None,
+            )
+            is None
+        ):
+            packet_extensions.transport_sequence_number = (
+                self.next_transport_sequence_number()
+            )
+        return RtpSendDecision()
+
+    def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
+        transport_sequence_number = getattr(
+            getattr(packet, "extensions", None), "transport_sequence_number", None
+        )
+        if transport_sequence_number is None:
+            return
+        self.on_packet_sent(
+            transport_sequence_number=transport_sequence_number,
+            send_time_us=context.send_time_us,
+            size_bytes=context.size_bytes,
+            payload_size_bytes=context.payload_size_bytes,
+            ssrc=packet.ssrc,
+            rtp_sequence_number=packet.sequence_number,
+            is_retransmission=context.is_retransmission,
+            pacing_info=context.pacing_info,
+        )
+
+    def on_rtp_received(
+        self, packet: object, context: RtpReceiveContext
+    ) -> list[object]:
+        return self.observe_incoming_rtp(
+            context.receiver,
+            packet,
+            context.arrival_time_ms,
+        )
 
     def handle_transport_feedback(
         self, packet: RtcpTransportLayerCcPacket | Any, now_us: int
