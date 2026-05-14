@@ -1,7 +1,7 @@
 import asyncio
 import datetime
 from unittest import TestCase
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from aiortc.rtcdtlstransport import (
     SRTP_AEAD_AES_256_GCM,
@@ -41,7 +41,7 @@ from rtc_types import RtcRuntimeContributions, RtpSendDecision
 
 from .fake_congestion import (
     TRANSPORT_CC_URI,
-    FakePacedPacketInfo,
+    FakeRtpPacer,
     FakeTransportCc,
     FakeTransportFeedback,
 )
@@ -126,10 +126,12 @@ class DummyRtpComponent:
         send_interceptor: DummyRtpSendInterceptor | None = None,
         sent_observer: DummyRtpSentObserver | None = None,
         receive_observer: DummyRtpReceiveObserver | None = None,
+        rtp_pacer: object | None = None,
     ) -> None:
         self.send_interceptor = send_interceptor
         self.sent_observer = sent_observer
         self.receive_observer = receive_observer
+        self.rtp_pacer = rtp_pacer
 
     def runtime_contributions(self, context: object) -> RtcRuntimeContributions:
         contributions = RtcRuntimeContributions()
@@ -139,6 +141,8 @@ class DummyRtpComponent:
             contributions.rtp_sent_observers.append(self.sent_observer)
         if self.receive_observer is not None:
             contributions.rtp_receive_observers.append(self.receive_observer)
+        if self.rtp_pacer is not None:
+            contributions.rtp_pacer = self.rtp_pacer
         return contributions
 
 
@@ -619,7 +623,10 @@ class RTCDtlsTransportTest(TestCase):
             transport1,
             [RTCCertificate.generateCertificate()],
             congestion_control=[
-                DummyRtpComponent(send_interceptor=send_interceptor)
+                DummyRtpComponent(
+                    send_interceptor=send_interceptor,
+                    rtp_pacer=FakeRtpPacer(),
+                )
             ],
         )
         extensions_map = HeaderExtensionsMap()
@@ -649,10 +656,11 @@ class RTCDtlsTransportTest(TestCase):
     @asynctest
     async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
+        component = FakeTransportCc()
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[FakeTransportCc()],
+            congestion_control=[component],
         )
         sender = DummyRtpSender()
         sender._ssrc = 1234
@@ -663,14 +671,8 @@ class RTCDtlsTransportTest(TestCase):
             sent_packets.append(RtpPacket.parse(data, sender._extensions_map))
 
         session._send_rtp = mock_send_rtp  # type: ignore
-        session._congestion_controller.has_probe_pending = Mock(return_value=True)
-        session._congestion_controller.pace_rtp_packet = AsyncMock(
-            return_value=FakePacedPacketInfo(probe_cluster_id=7)
-        )
-        session._congestion_controller.next_transport_sequence_number = Mock(
-            return_value=55
-        )
-        session._congestion_controller.on_packet_sent = Mock()
+        component.pacer.pending_probe = True
+        component.controller.next_sequence_number = 55
 
         sent = await session._send_rtp_probe_padding_packet()
 
@@ -678,7 +680,7 @@ class RTCDtlsTransportTest(TestCase):
         self.assertEqual(len(sent_packets), 1)
         self.assertEqual(sent_packets[0].extensions.transport_sequence_number, 55)
         self.assertEqual(sent_packets[0].padding_size, 255)
-        session._congestion_controller.on_packet_sent.assert_called_once()
+        self.assertEqual(len(component.controller.sent_packets), 1)
 
     @asynctest
     async def test_handle_rtp_data_emits_twcc_feedback(self) -> None:

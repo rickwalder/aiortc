@@ -4,14 +4,26 @@ from dataclasses import dataclass
 from struct import pack, unpack
 from typing import Any
 
+from aiortc.rtp import (
+    RTCP_PSFB_APP,
+    RtcpPsfbPacket,
+    RtcpTransportLayerCcPacket,
+    pack_remb_fci,
+)
 from pyrtcp import RTCP_RTPFB, RtcpHeader
 from rtc_types import (
+    BitrateTarget,
     RtcCapabilities,
     RtcpFeedbackCapability,
     RtcpFeedbackPacketCapability,
+    RtcpReceiveContext,
     RtcRuntimeContext,
     RtcRuntimeContributions,
     RtpHeaderExtensionCapability,
+    RtpReceiveContext,
+    RtpSendContext,
+    RtpSendDecision,
+    RtpSentContext,
 )
 
 
@@ -19,14 +31,10 @@ def install_fake_congestion_components(controller: object, *components: object) 
     context = FakeRuntimeContext(controller)
     for component in components:
         contributions = component.runtime_contributions(context)
-        if contributions.remb_receiver is not None:
-            controller.set_remb_receiver(contributions.remb_receiver)
-        if contributions.transport_rate_controller is not None:
-            controller.set_transport_rate_controller(
-                contributions.transport_rate_controller
-            )
-        if contributions.rtp_pacer is not None:
-            controller.set_rtp_pacer(contributions.rtp_pacer)
+        for source in contributions.bitrate_target_sources:
+            source.set_bitrate_target_observer(controller)
+        for observer in contributions.round_trip_time_observers:
+            controller.add_round_trip_time_observer(observer)
 
 
 class FakeRuntimeContext:
@@ -214,6 +222,43 @@ class FakeRembReceiver:
         ]
 
 
+class FakeRembRtpReceiveObserver:
+    def __init__(self, receiver: FakeRembReceiver) -> None:
+        self.receiver = receiver
+
+    def on_rtp_received(
+        self, packet: object, context: RtpReceiveContext
+    ) -> list[object]:
+        feedback_ssrc = context.receiver._get_rtcp_ssrc()
+        return [
+            RtcpPsfbPacket(
+                fmt=RTCP_PSFB_APP,
+                ssrc=feedback.feedback_ssrc,
+                media_ssrc=0,
+                fci=pack_remb_fci(feedback.bitrate, feedback.ssrcs),
+            )
+            for feedback in self.receiver.observe_incoming_rtp(
+                receiver=context.receiver,
+                packet=packet,
+                arrival_time_ms=context.arrival_time_ms,
+                feedback_ssrc=feedback_ssrc,
+            )
+        ]
+
+
+class FakeRembRtcpReceiveObserver:
+    def __init__(self) -> None:
+        self.observer: object | None = None
+
+    def set_bitrate_target_observer(self, observer: object | None) -> None:
+        self.observer = observer
+
+    def on_rtcp_received(
+        self, packet: object, context: RtcpReceiveContext
+    ) -> list[object]:
+        return []
+
+
 class FakeTransportController:
     def __init__(self) -> None:
         self.active = False
@@ -290,13 +335,130 @@ class FakeTransportController:
         return self.telemetry
 
 
+class FakeTransportRtpSendInterceptor:
+    def __init__(self, controller: FakeTransportController) -> None:
+        self.controller = controller
+
+    def prepare_rtp(
+        self, packet: object, context: RtpSendContext
+    ) -> RtpSendDecision:
+        if (
+            context.is_video
+            and context.supports_transport_sequence_number
+            and packet.extensions.transport_sequence_number is None
+        ):
+            packet.extensions.transport_sequence_number = (
+                self.controller.next_transport_sequence_number()
+            )
+            return RtpSendDecision(pace_packet=True)
+        return RtpSendDecision()
+
+
+class FakeTransportRtpSentObserver:
+    def __init__(self, controller: FakeTransportController) -> None:
+        self.controller = controller
+
+    def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
+        transport_sequence_number = packet.extensions.transport_sequence_number
+        if transport_sequence_number is None:
+            return
+
+        @dataclass(frozen=True)
+        class Packet:
+            transport_sequence_number: int
+            send_time_us: int
+            size_bytes: int
+            payload_size_bytes: int
+            ssrc: int
+            rtp_sequence_number: int
+            is_retransmission: bool
+            pacing_info: object | None
+
+        self.controller.on_packet_sent(
+            Packet(
+                transport_sequence_number=transport_sequence_number,
+                send_time_us=context.send_time_us,
+                size_bytes=context.size_bytes,
+                payload_size_bytes=context.payload_size_bytes,
+                ssrc=packet.ssrc,
+                rtp_sequence_number=packet.sequence_number,
+                is_retransmission=context.is_retransmission,
+                pacing_info=context.pacing_info,
+            )
+        )
+
+
+class FakeTransportRtpReceiveObserver:
+    def __init__(self, controller: FakeTransportController) -> None:
+        self.controller = controller
+
+    def on_rtp_received(
+        self, packet: object, context: RtpReceiveContext
+    ) -> list[object]:
+        feedback_ssrc = context.receiver._get_rtcp_ssrc()
+        transport_sequence_number = packet.extensions.transport_sequence_number
+        if feedback_ssrc is None or transport_sequence_number is None:
+            return []
+        return [
+            RtcpTransportLayerCcPacket(feedback=feedback)
+            for feedback in self.controller.observe_incoming_rtp(
+                media_ssrc=packet.ssrc,
+                transport_sequence_number=transport_sequence_number,
+                arrival_time_us=context.arrival_time_us,
+                feedback_ssrc=feedback_ssrc,
+            )
+        ]
+
+
+class FakeTransportRtcpReceiveObserver:
+    def __init__(self, controller: FakeTransportController) -> None:
+        self.controller = controller
+        self.observer: object | None = None
+
+    def set_bitrate_target_observer(self, observer: object | None) -> None:
+        self.observer = observer
+
+    def on_rtcp_received(
+        self, packet: object, context: RtcpReceiveContext
+    ) -> list[object]:
+        feedback = getattr(packet, "feedback", packet)
+        if getattr(feedback, "fmt", None) != RTPFB_TRANSPORT_CC_FMT:
+            return []
+        update = self.controller.handle_transport_feedback(feedback, context.now_us)
+        if self.observer is not None:
+            self.observer.on_bitrate_target(
+                BitrateTarget(
+                    target_bitrate_bps=update.target_bitrate_bps,
+                    source="transport-cc",
+                    reason=update.reason,
+                    now_ms=context.now_ms,
+                    update=update,
+                    telemetry=self.controller.get_telemetry(),
+                    pacer_bitrate_bps=self.controller.get_pacer_config().send_bitrate_bps,
+                )
+            )
+        return []
+
+
+class FakeTransportRoundTripTimeObserver:
+    def __init__(self, controller: FakeTransportController) -> None:
+        self.controller = controller
+
+    def on_round_trip_time(self, rtt_ms: int) -> None:
+        self.controller.on_round_trip_time(rtt_ms * 1000)
+
+
 class FakeRtpPacer:
     def __init__(self) -> None:
         self.paced_sizes: list[int] = []
         self.pending_probe = False
 
     async def pace(
-        self, *, size_bytes: int, config: object, now_ms: int | None = None
+        self,
+        *,
+        size_bytes: int,
+        config: object | None = None,
+        now_ms: int | None = None,
     ) -> FakePacedPacketInfo:
         self.paced_sizes.append(size_bytes)
         if self.pending_probe:
@@ -304,8 +466,16 @@ class FakeRtpPacer:
             return FakePacedPacketInfo(probe_cluster_id=7)
         return FakePacedPacketInfo()
 
-    def is_probe_pending(self, config: object) -> bool:
+    def is_probe_pending(self, config: object | None = None) -> bool:
         return self.pending_probe
+
+    def update_queue(
+        self,
+        *,
+        queue_bytes: int,
+        oldest_queue_age_ms: int = 0,
+    ) -> None:
+        pass
 
 
 class FakeRemb:
@@ -330,7 +500,13 @@ class FakeRemb:
     def runtime_contributions(
         self, context: RtcRuntimeContext
     ) -> RtcRuntimeContributions:
-        return RtcRuntimeContributions(remb_receiver=self.receiver)
+        rtcp_observer = FakeRembRtcpReceiveObserver()
+        return RtcRuntimeContributions(
+            rtp_receive_observers=[FakeRembRtpReceiveObserver(self.receiver)],
+            rtcp_receive_observers=[rtcp_observer],
+            bitrate_target_sources=[rtcp_observer],
+            round_trip_time_observers=[self.receiver],
+        )
 
 
 class FakeTransportCc:
@@ -362,8 +538,20 @@ class FakeTransportCc:
     def runtime_contributions(
         self, context: RtcRuntimeContext
     ) -> RtcRuntimeContributions:
+        rtcp_observer = FakeTransportRtcpReceiveObserver(self.controller)
         return RtcRuntimeContributions(
-            transport_rate_controller=self.controller,
+            rtcp_receive_observers=[rtcp_observer],
+            rtp_send_interceptors=[
+                FakeTransportRtpSendInterceptor(self.controller)
+            ],
+            rtp_sent_observers=[FakeTransportRtpSentObserver(self.controller)],
+            rtp_receive_observers=[
+                FakeTransportRtpReceiveObserver(self.controller)
+            ],
             rtp_pacer=self.pacer,
             rtcp_codecs=[FakeTwccRtcpCodec()],
+            bitrate_target_sources=[rtcp_observer],
+            round_trip_time_observers=[
+                FakeTransportRoundTripTimeObserver(self.controller)
+            ],
         )

@@ -8,25 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
 from rtc_types import (
-    RtcpReceiveContext,
-    RtpReceiveContext,
-    RtpSendContext,
-    RtpSendDecision,
+    BitrateTarget,
+    RoundTripTimeObserver,
     RtpSentContext,
 )
 
 from . import clock
-from .rtp import (
-    RTCP_PSFB_APP,
-    RTCP_RTPFB,
-    RTCP_RTPFB_TRANSPORT_CC,
-    AnyRtcpPacket,
-    RtcpPsfbPacket,
-    RtcpTransportLayerCcPacket,
-    RtpPacket,
-    pack_remb_fci,
-    unpack_remb_fci,
-)
 from .transporttrace import NetTraceWriter
 
 logger = logging.getLogger(__name__)
@@ -66,10 +53,6 @@ class CongestionControlledReceiver(Protocol):
     def _get_rtcp_ssrc(self) -> Optional[int]: ...
 
 
-IncomingRtpHandler = Callable[
-    [CongestionControlledReceiver, RtpPacket, int],
-    list[AnyRtcpPacket],
-]
 RttHandler = Callable[[int], None]
 
 
@@ -110,6 +93,10 @@ class SenderBitrateAllocator:
     def states(self) -> list[SenderState]:
         return list(self.__senders.values())
 
+    @property
+    def session_target_bitrate(self) -> int:
+        return self.__current_session_target()
+
     def register_sender(self, sender: CongestionControlledSender) -> None:
         if sender.kind != "video":
             return
@@ -141,6 +128,10 @@ class SenderBitrateAllocator:
         self.__session_target_bitrate = target
         self.recompute_allocation()
         return True
+
+    def set_session_target_bitrate(self, bitrate: int) -> None:
+        self.__session_target_bitrate = max(1, int(bitrate))
+        self.recompute_allocation()
 
     def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
         state = self.__senders.get(ssrc)
@@ -231,30 +222,9 @@ class SenderBitrateAllocator:
 
 
 @dataclass(frozen=True)
-class TransportSentPacket:
-    transport_sequence_number: int
-    send_time_us: int
-    size_bytes: int
-    ssrc: int
-    rtp_sequence_number: int
-    payload_size_bytes: int = 0
-    is_retransmission: bool = False
-    pacing_info: Any | None = None
-
-
-@dataclass(frozen=True)
 class _NullPacerConfig:
     send_bitrate_bps: int = 0
     probe_cluster: Any | None = None
-
-
-@dataclass(frozen=True)
-class _NullPacedPacketInfo:
-    probe_cluster_id: int = -1
-
-    @property
-    def is_probe(self) -> bool:
-        return False
 
 
 @dataclass(frozen=True)
@@ -350,30 +320,6 @@ class _RateLimiter:
 
 
 class _NullTransportControl:
-    active = False
-
-    def on_round_trip_time(self, rtt_us: int) -> None:
-        pass
-
-    def next_transport_sequence_number(self) -> int:
-        return 0
-
-    def on_packet_sent(self, packet: TransportSentPacket) -> None:
-        pass
-
-    def observe_incoming_rtp(
-        self,
-        *,
-        media_ssrc: int,
-        transport_sequence_number: int,
-        arrival_time_us: int,
-        feedback_ssrc: int,
-    ) -> list[Any]:
-        return []
-
-    def handle_transport_feedback(self, packet: Any, feedback_time_us: int) -> None:
-        return None
-
     def get_pacer_config(self) -> _NullPacerConfig:
         return _NullPacerConfig()
 
@@ -389,20 +335,6 @@ class _NullTransportControl:
         return _NullTransportTelemetry()
 
 
-class _NullRtpPacer:
-    async def pace(
-        self,
-        *,
-        size_bytes: int,
-        config: Any,
-        now_ms: int | None = None,
-    ) -> _NullPacedPacketInfo:
-        return _NullPacedPacketInfo()
-
-    def is_probe_pending(self, config: Any) -> bool:
-        return False
-
-
 class TransportCongestionController:
     """
     Transport-scoped adapter for congestion-control runtime hardpoints.
@@ -415,16 +347,12 @@ class TransportCongestionController:
     def __init__(self) -> None:
         self.__receivers: set[CongestionControlledReceiver] = set()
         self.__net_trace_writer = NetTraceWriter.from_environment()
-        self.__remb_control = None
-        self.__remote_bitrate_estimator = None
         self.__transport_control = _NullTransportControl()
         self.__bitrate_allocator = SenderBitrateAllocator(
             self.__transport_control.get_target_bitrate
         )
-        self.__rtp_pacer = _NullRtpPacer()
-        self.__has_rtp_pacer = False
-        self.__incoming_rtp_handlers: list[IncomingRtpHandler] = []
         self.__rtt_handlers: list[RttHandler] = []
+        self.__transport_feedback_active = False
         self.__retransmission_rate_limiter = _RateLimiter(
             _RETRANSMISSION_RATE_LIMIT_WINDOW_MS
         )
@@ -440,29 +368,10 @@ class TransportCongestionController:
     def trace_writer(self) -> NetTraceWriter | None:
         return self.__net_trace_writer
 
-    def set_remb_receiver(self, receiver: object) -> None:
-        self.__remb_control = receiver
-        self.__remote_bitrate_estimator = getattr(receiver, "estimator", None)
-        self.__incoming_rtp_handlers.append(self.__observe_incoming_remb)
-        on_round_trip_time = getattr(receiver, "on_round_trip_time", None)
-        if on_round_trip_time is not None:
-            self.__rtt_handlers.append(on_round_trip_time)
-
-    def set_transport_rate_controller(self, controller: object) -> None:
-        self.__transport_control = controller
-        self.__bitrate_allocator = SenderBitrateAllocator(
-            self.__transport_control.get_target_bitrate
-        )
-        self.__incoming_rtp_handlers.insert(0, self.__observe_incoming_transport_cc)
-        on_round_trip_time = getattr(controller, "on_round_trip_time", None)
-        if on_round_trip_time is not None:
-            self.__rtt_handlers.append(
-                lambda rtt_ms, handler=on_round_trip_time: handler(rtt_ms * 1000)
-            )
-
-    def set_rtp_pacer(self, pacer: object) -> None:
-        self.__rtp_pacer = pacer
-        self.__has_rtp_pacer = True
+    def add_round_trip_time_observer(
+        self, observer: RoundTripTimeObserver
+    ) -> None:
+        self.__rtt_handlers.append(observer.on_round_trip_time)
 
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
         if getattr(receiver, "kind", None) == "video":
@@ -480,7 +389,7 @@ class TransportCongestionController:
     def update_receiver_estimate(
         self, bitrate: int, ssrcs: list[int], now_ms: int
     ) -> None:
-        if self.__transport_control.active:
+        if self.__transport_feedback_active:
             if self.__net_trace_writer is not None:
                 self.__net_trace_writer.write_remb_receiver_estimate(
                     bitrate=bitrate,
@@ -521,36 +430,44 @@ class TransportCongestionController:
                 allocations=self.__bitrate_allocator.sender_trace_allocations(),
             )
 
-    def on_rtcp_received(
-        self, packet: object, context: RtcpReceiveContext
-    ) -> list[object]:
-        if (
-            isinstance(packet, RtcpTransportLayerCcPacket)
-            or (
-                getattr(packet, "packet_type", None) == RTCP_RTPFB
-                and getattr(packet, "fmt", None) == RTCP_RTPFB_TRANSPORT_CC
+    def on_bitrate_target(self, target: BitrateTarget) -> None:
+        if target.source == "remb":
+            self.update_receiver_estimate(
+                target.target_bitrate_bps,
+                list(target.ssrcs),
+                target.now_ms if target.now_ms is not None else clock.current_ms(),
             )
-        ):
-            self.handle_transport_feedback(packet, context.now_us)
-            return []
+            return
 
-        if isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_APP:
-            try:
-                bitrate, ssrcs = unpack_remb_fci(packet.fci)
-            except ValueError:
-                pass
-            else:
-                self.update_receiver_estimate(bitrate, ssrcs, context.now_ms)
-        return []
+        previous_target = self.__bitrate_allocator.session_target_bitrate
+        self.__bitrate_allocator.set_session_target_bitrate(
+            target.target_bitrate_bps
+        )
+        if target.source == "transport-cc":
+            self.__transport_feedback_active = True
+        if target.update is not None:
+            self.__log_target_update(
+                previous_target,
+                target.update,
+                telemetry=target.telemetry,
+            )
+            self.__trace_target_update(
+                previous_target,
+                target.update,
+                telemetry=target.telemetry,
+            )
+        self.__log_delay_usage_transition(telemetry=target.telemetry)
+        self.__log_telemetry(
+            target.now_ms if target.now_ms is not None else clock.current_ms(),
+            telemetry=target.telemetry,
+            pacer_bitrate_bps=target.pacer_bitrate_bps,
+        )
 
     def set_rtt(self, rtt_ms: int) -> None:
         if rtt_ms <= 0:
             return
         for handler in self.__rtt_handlers:
             handler(rtt_ms)
-
-    def next_transport_sequence_number(self) -> int:
-        return self.__transport_control.next_transport_sequence_number()
 
     def allow_retransmission(
         self, *, size_bytes: int, now_ms: Optional[int] = None
@@ -560,7 +477,7 @@ class TransportCongestionController:
             if now_ms is None
             else now_ms
         )
-        target_bitrate = self.__transport_control.get_target_bitrate()
+        target_bitrate = self.__bitrate_allocator.session_target_bitrate
         self.__retransmission_rate_limiter.set_max_rate(target_bitrate)
         if self.__retransmission_rate_limiter.try_use(size_bytes, now_ms):
             return True
@@ -572,7 +489,6 @@ class TransportCongestionController:
     def on_packet_sent(
         self,
         *,
-        transport_sequence_number: int,
         send_time_us: int,
         size_bytes: int,
         payload_size_bytes: int = 0,
@@ -584,18 +500,6 @@ class TransportCongestionController:
         if is_retransmission:
             self.__retransmission_sent_bytes += max(0, size_bytes)
         self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
-        self.__transport_control.on_packet_sent(
-            TransportSentPacket(
-                transport_sequence_number=transport_sequence_number,
-                send_time_us=send_time_us,
-                size_bytes=size_bytes,
-                payload_size_bytes=payload_size_bytes,
-                ssrc=ssrc,
-                rtp_sequence_number=rtp_sequence_number,
-                is_retransmission=is_retransmission,
-                pacing_info=pacing_info,
-            )
-        )
 
     def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
         self.__bitrate_allocator.observe_encoded_frame(
@@ -603,36 +507,8 @@ class TransportCongestionController:
             payload_bytes=payload_bytes,
         )
 
-    def prepare_rtp(
-        self, packet: object, context: RtpSendContext
-    ) -> RtpSendDecision:
-        packet_extensions = getattr(packet, "extensions", None)
-        should_use_transport_sequence_number = (
-            context.is_video
-            and context.supports_transport_sequence_number
-        )
-        if (
-            should_use_transport_sequence_number
-            and getattr(packet_extensions, "transport_sequence_number", None) is None
-        ):
-            packet_extensions.transport_sequence_number = (
-                self.next_transport_sequence_number()
-            )
-        return RtpSendDecision(
-            pace_packet=(
-                self.__has_rtp_pacer
-                and should_use_transport_sequence_number
-            )
-        )
-
     def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
-        transport_sequence_number = getattr(
-            getattr(packet, "extensions", None), "transport_sequence_number", None
-        )
-        if transport_sequence_number is None:
-            return
         self.on_packet_sent(
-            transport_sequence_number=transport_sequence_number,
             send_time_us=context.send_time_us,
             size_bytes=context.size_bytes,
             payload_size_bytes=context.payload_size_bytes,
@@ -642,123 +518,9 @@ class TransportCongestionController:
             pacing_info=context.pacing_info,
         )
 
-    def on_rtp_received(
-        self, packet: object, context: RtpReceiveContext
-    ) -> list[object]:
-        return self.observe_incoming_rtp(
-            context.receiver,
-            packet,
-            context.arrival_time_ms,
-        )
-
-    def handle_transport_feedback(
-        self, packet: RtcpTransportLayerCcPacket | Any, now_us: int
-    ) -> None:
-        previous_target = self.__transport_control.get_target_bitrate()
-        feedback = getattr(packet, "feedback", packet)
-        update = self.__transport_control.handle_transport_feedback(
-            feedback, now_us
-        )
-        if update is not None:
-            self.__bitrate_allocator.recompute_allocation()
-            self.__log_target_update(previous_target, update)
-            self.__trace_target_update(previous_target, update)
-        self.__log_delay_usage_transition()
-        self.__log_telemetry(now_us // 1000)
-
-    def get_pacer_config(self):
-        return self.__transport_control.get_pacer_config()
-
-    def update_pacing_queue(
-        self, queue_bytes: int, oldest_queue_age_ms: int = 0
-    ) -> None:
-        self.__transport_control.update_pacing_queue(
-            queue_bytes,
-            oldest_queue_age_ms=oldest_queue_age_ms,
-        )
-
-    def has_probe_pending(self) -> bool:
-        config = self.__transport_control.get_pacer_config()
-        return self.__rtp_pacer.is_probe_pending(config)
-
-    async def pace_rtp_packet(
-        self, *, size_bytes: int, now_ms: Optional[int] = None
-    ) -> Any:
-        return await self.__rtp_pacer.pace(
-            size_bytes=size_bytes,
-            config=self.__transport_control.get_pacer_config(),
-            now_ms=now_ms,
-        )
-
-    def observe_incoming_rtp(
-        self,
-        receiver: CongestionControlledReceiver,
-        packet: RtpPacket,
-        arrival_time_ms: int,
-    ) -> list[AnyRtcpPacket]:
-        feedback: list[AnyRtcpPacket] = []
-        for handler in self.__incoming_rtp_handlers:
-            feedback.extend(handler(receiver, packet, arrival_time_ms))
-        return feedback
-
-    def __observe_incoming_remb(
-        self,
-        receiver: CongestionControlledReceiver,
-        packet: RtpPacket,
-        arrival_time_ms: int,
-    ) -> list[AnyRtcpPacket]:
-        if self.__transport_control.active:
-            return []
-
-        feedback: list[AnyRtcpPacket] = []
-        if self.__remb_control is not None:
-            for remb_feedback in self.__remb_control.observe_incoming_rtp(
-                receiver=receiver,
-                packet=packet,
-                arrival_time_ms=arrival_time_ms,
-                feedback_ssrc=self.__get_feedback_ssrc(),
-            ):
-                feedback.append(self.__make_remb_packet(remb_feedback))
-        return feedback
-
-    def __make_remb_packet(self, feedback: Any) -> RtcpPsfbPacket:
-        return RtcpPsfbPacket(
-            fmt=RTCP_PSFB_APP,
-            ssrc=feedback.feedback_ssrc,
-            media_ssrc=0,
-            fci=pack_remb_fci(feedback.bitrate, feedback.ssrcs),
-        )
-
-    def __observe_incoming_transport_cc(
-        self,
-        receiver: CongestionControlledReceiver,
-        packet: RtpPacket,
-        arrival_time_ms: int,
-    ) -> list[RtcpTransportLayerCcPacket]:
-        feedback_ssrc = self.__get_feedback_ssrc()
-        if feedback_ssrc is None or packet.extensions.transport_sequence_number is None:
-            return []
-
-        feedback_packets = self.__transport_control.observe_incoming_rtp(
-            media_ssrc=packet.ssrc,
-            transport_sequence_number=packet.extensions.transport_sequence_number,
-            arrival_time_us=arrival_time_ms * 1000,
-            feedback_ssrc=feedback_ssrc,
-        )
-        return [
-            RtcpTransportLayerCcPacket(feedback=feedback)
-            for feedback in feedback_packets
-        ]
-
-    def __get_feedback_ssrc(self) -> Optional[int]:
-        for receiver in self.__receivers:
-            ssrc = receiver._get_rtcp_ssrc()
-            if ssrc is not None:
-                return ssrc
-        return None
-
-    def __log_target_update(self, previous_target, update) -> None:
-        telemetry = self.__transport_control.get_telemetry()
+    def __log_target_update(self, previous_target, update, telemetry=None) -> None:
+        if telemetry is None:
+            telemetry = self.__transport_control.get_telemetry()
         previous = (
             previous_target
             if previous_target is not None
@@ -870,17 +632,22 @@ class TransportCongestionController:
         )
         self.__last_logged_target_bitrate = update.target_bitrate_bps
 
-    def __trace_target_update(self, previous_target, update) -> None:
+    def __trace_target_update(self, previous_target, update, telemetry=None) -> None:
         if self.__net_trace_writer is None:
             return
         self.__net_trace_writer.write_target_update(
             previous_target=previous_target,
             update=update,
-            telemetry=self.__transport_control.get_telemetry(),
+            telemetry=(
+                telemetry
+                if telemetry is not None
+                else self.__transport_control.get_telemetry()
+            ),
         )
 
-    def __log_delay_usage_transition(self) -> None:
-        telemetry = self.__transport_control.get_telemetry()
+    def __log_delay_usage_transition(self, telemetry=None) -> None:
+        if telemetry is None:
+            telemetry = self.__transport_control.get_telemetry()
         usage = telemetry.delay_usage
         previous = self.__last_logged_delay_usage
         if usage == previous:
@@ -916,7 +683,12 @@ class TransportCongestionController:
             telemetry.groups_seen,
         )
 
-    def __log_telemetry(self, now_ms: int) -> None:
+    def __log_telemetry(
+        self,
+        now_ms: int,
+        telemetry=None,
+        pacer_bitrate_bps: int | None = None,
+    ) -> None:
         if (
             self.__last_telemetry_ms is not None
             and now_ms - self.__last_telemetry_ms < _TELEMETRY_INTERVAL_MS
@@ -924,11 +696,17 @@ class TransportCongestionController:
             return
         self.__last_telemetry_ms = now_ms
 
-        telemetry = self.__transport_control.get_telemetry()
+        if telemetry is None:
+            telemetry = self.__transport_control.get_telemetry()
         if telemetry.feedback_count <= 0:
             return
 
         pacer = self.__transport_control.get_pacer_config()
+        pacer_bitrate = (
+            pacer_bitrate_bps
+            if pacer_bitrate_bps is not None
+            else pacer.send_bitrate_bps
+        )
         states = self.__bitrate_allocator.states
         allocated_total = sum(state.allocated_bitrate for state in states)
         applied_total = sum(
@@ -1076,7 +854,7 @@ class TransportCongestionController:
             telemetry.recovered_count,
             loss_fraction,
             telemetry.last_target_bitrate_bps,
-            pacer.send_bitrate_bps,
+            pacer_bitrate,
             allocated_total,
             applied_total,
             encoder_total,

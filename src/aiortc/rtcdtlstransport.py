@@ -23,6 +23,7 @@ from rtc_types import (
     RtcpReceiveObserver,
     RtcRuntimeComponent,
     RtcRuntimeContributions,
+    RtpPacer,
     RtpReceiveContext,
     RtpReceiveObserver,
     RtpSendContext,
@@ -296,6 +297,13 @@ def _clone_rtp_packet(packet: RtpPacket) -> RtpPacket:
     return cloned
 
 
+def _serialize_runtime_packet(packet: object) -> bytes:
+    serialize = getattr(packet, "serialize", None)
+    if serialize is not None:
+        return serialize()
+    return bytes(packet)
+
+
 class RtpRouter:
     """
     Router to associate RTP/RTCP packets with streams.
@@ -431,20 +439,15 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue: deque[_QueuedRtpPacket] = deque()
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
+        self._rtp_pacer: Optional[RtpPacer] = None
         self._rtcp_packet_registry = RtcpPacketRegistry()
         self._congestion_controller = TransportCongestionController()
-        self._rtcp_receive_handlers: list[RtcpReceiveObserver] = [
-            self._congestion_controller
-        ]
-        self._rtp_send_interceptors: list[RtpSendInterceptor] = [
-            self._congestion_controller
-        ]
+        self._rtcp_receive_handlers: list[RtcpReceiveObserver] = []
+        self._rtp_send_interceptors: list[RtpSendInterceptor] = []
         self._rtp_sent_observers: list[RtpSentObserver] = [
             self._congestion_controller
         ]
-        self._rtp_receive_observers: list[RtpReceiveObserver] = [
-            self._congestion_controller
-        ]
+        self._rtp_receive_observers: list[RtpReceiveObserver] = []
         runtime_context = AiortcRuntimeContext(
             trace_writer=self._congestion_controller.trace_writer
         )
@@ -483,13 +486,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_sent_observers.extend(contributions.rtp_sent_observers)
         self._rtp_receive_observers.extend(contributions.rtp_receive_observers)
         if contributions.rtp_pacer is not None:
-            self._congestion_controller.set_rtp_pacer(contributions.rtp_pacer)
-        if contributions.remb_receiver is not None:
-            self._congestion_controller.set_remb_receiver(contributions.remb_receiver)
-        if contributions.transport_rate_controller is not None:
-            self._congestion_controller.set_transport_rate_controller(
-                contributions.transport_rate_controller
-            )
+            self._rtp_pacer = contributions.rtp_pacer
+        for source in contributions.bitrate_target_sources:
+            source.set_bitrate_target_observer(self._congestion_controller)
+        for observer in contributions.round_trip_time_observers:
+            self._congestion_controller.add_round_trip_time_observer(observer)
 
     @property
     def state(self) -> str:
@@ -725,7 +726,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 feedback_packets = handler.on_rtcp_received(packet, context)
                 for feedback_packet in feedback_packets:
                     try:
-                        await self._send_rtp(bytes(feedback_packet))
+                        await self._send_rtp(
+                            _serialize_runtime_packet(feedback_packet)
+                        )
                     except ConnectionError:
                         pass
             # route RTCP packet
@@ -750,7 +753,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 feedback_packets = observer.on_rtp_received(packet, context)
                 for feedback_packet in feedback_packets:
                     try:
-                        await self._send_rtp(bytes(feedback_packet))
+                        await self._send_rtp(
+                            _serialize_runtime_packet(feedback_packet)
+                        )
                     except ConnectionError:
                         pass
             await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
@@ -937,7 +942,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             if send_decision.drop_packet:
                 return
             packet_bytes = packet.serialize(extensions_map)
-            if send_decision.pace_packet:
+            if send_decision.pace_packet and self._rtp_pacer is not None:
                 queued = _QueuedRtpPacket(
                     packet=packet,
                     extensions_map=extensions_map,
@@ -961,11 +966,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             )
 
     async def _send_next_rtp_packet_from_queue(self) -> bool:
-        if not self._rtp_queue:
+        if not self._rtp_queue or self._rtp_pacer is None:
             return False
 
         queued = self._rtp_queue[0]
-        pacing_info = await self._congestion_controller.pace_rtp_packet(
+        pacing_info = await self._rtp_pacer.pace(
             size_bytes=queued.size_bytes,
         )
         async with self._rtp_send_lock:
@@ -1005,10 +1010,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             )
         else:
             oldest_age_ms = 0
-        self._congestion_controller.update_pacing_queue(
-            self._rtp_queue_bytes,
-            oldest_queue_age_ms=oldest_age_ms,
-        )
+        if self._rtp_pacer is not None:
+            self._rtp_pacer.update_queue(
+                queue_bytes=self._rtp_queue_bytes,
+                oldest_queue_age_ms=oldest_age_ms,
+            )
 
     def _set_role(self, role: str) -> None:
         self._role = role
@@ -1022,14 +1028,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                         await asyncio.sleep(0)
                         continue
 
-                if self._congestion_controller.has_probe_pending():
+                if self._has_probe_pending():
                     sent = await self._send_rtp_probe_padding_packet()
                     if sent:
                         await asyncio.sleep(0)
                         continue
 
                 self._rtp_queue_event.clear()
-                if self._rtp_queue or self._congestion_controller.has_probe_pending():
+                if self._rtp_queue or self._has_probe_pending():
                     continue
                 try:
                     await asyncio.wait_for(self._rtp_queue_event.wait(), timeout=0.01)
@@ -1046,9 +1052,15 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 return sender
         return None
 
+    def _has_probe_pending(self) -> bool:
+        return (
+            self._rtp_pacer is not None
+            and self._rtp_pacer.is_probe_pending()
+        )
+
     async def _send_rtp_probe_padding_packet(self) -> bool:
         async with self._rtp_send_lock:
-            if not self._congestion_controller.has_probe_pending():
+            if not self._has_probe_pending():
                 return False
 
             sender = self.__get_rtp_probe_padding_sender()
@@ -1079,7 +1091,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 return False
             packet_bytes = packet.serialize(extensions_map)
 
-        pacing_info = await self._congestion_controller.pace_rtp_packet(
+        assert self._rtp_pacer is not None
+        pacing_info = await self._rtp_pacer.pace(
             size_bytes=len(packet_bytes),
         )
         if not pacing_info.is_probe:

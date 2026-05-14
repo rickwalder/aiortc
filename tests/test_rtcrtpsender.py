@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiortc import MediaStreamTrack
 from aiortc.codecs import PCMU_CODEC
-from aiortc.congestion import TransportCongestionController
 from aiortc.exceptions import InvalidStateError
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiortc.rtcrtpparameters import (
@@ -36,8 +35,8 @@ from tests.test_mediastreams import VideoPacketStreamTrack
 
 from .fake_congestion import (
     TRANSPORT_CC_URI,
+    FakeRuntimeContext,
     FakeTransportCc,
-    install_fake_congestion_components,
 )
 from .utils import ClosedDtlsTransport, asynctest, dummy_dtls_transport_pair
 
@@ -321,17 +320,11 @@ class RTCRtpSenderTest(TestCase):
         async with dummy_dtls_transport_pair() as (local_transport, _):
             local_transport._send_rtp = mock_send_rtp  # type: ignore
             component = FakeTransportCc()
-            local_transport._congestion_controller = TransportCongestionController()
-            install_fake_congestion_components(
-                local_transport._congestion_controller,
-                component,
+            local_transport._add_runtime_contributions(
+                component.runtime_contributions(
+                    FakeRuntimeContext(local_transport._congestion_controller)
+                )
             )
-            local_transport._rtp_send_interceptors = [
-                local_transport._congestion_controller
-            ]
-            local_transport._rtp_sent_observers = [
-                local_transport._congestion_controller
-            ]
             component.pacer.pace = AsyncMock(wraps=component.pacer.pace)
 
             sender = RTCRtpSender(VideoStreamTrack(), local_transport)
