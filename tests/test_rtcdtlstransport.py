@@ -37,7 +37,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from rtc_types import RtpSendDecision
+from rtc_types import RtcRuntimeContributions, RtpSendDecision
 
 from .fake_congestion import (
     TRANSPORT_CC_URI,
@@ -80,8 +80,8 @@ class DummyRtcpReceiveComponent:
     def __init__(self, handler: DummyRtcpReceiveHandler) -> None:
         self.handler = handler
 
-    def rtcp_receive_handlers(self) -> tuple[DummyRtcpReceiveHandler, ...]:
-        return (self.handler,)
+    def runtime_contributions(self, context: object) -> RtcRuntimeContributions:
+        return RtcRuntimeContributions(rtcp_receive_observers=[self.handler])
 
 
 class DummyRtpSendInterceptor:
@@ -131,20 +131,15 @@ class DummyRtpComponent:
         self.sent_observer = sent_observer
         self.receive_observer = receive_observer
 
-    def rtp_send_interceptors(self) -> tuple[DummyRtpSendInterceptor, ...]:
-        if self.send_interceptor is None:
-            return ()
-        return (self.send_interceptor,)
-
-    def rtp_sent_observers(self) -> tuple[DummyRtpSentObserver, ...]:
-        if self.sent_observer is None:
-            return ()
-        return (self.sent_observer,)
-
-    def rtp_receive_observers(self) -> tuple[DummyRtpReceiveObserver, ...]:
-        if self.receive_observer is None:
-            return ()
-        return (self.receive_observer,)
+    def runtime_contributions(self, context: object) -> RtcRuntimeContributions:
+        contributions = RtcRuntimeContributions()
+        if self.send_interceptor is not None:
+            contributions.rtp_send_interceptors.append(self.send_interceptor)
+        if self.sent_observer is not None:
+            contributions.rtp_sent_observers.append(self.sent_observer)
+        if self.receive_observer is not None:
+            contributions.rtp_receive_observers.append(self.receive_observer)
+        return contributions
 
 
 class DummyRtpReceiver:

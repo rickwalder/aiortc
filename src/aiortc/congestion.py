@@ -95,6 +95,141 @@ class TelemetrySnapshot:
     encoded_payload_bytes_by_ssrc: dict[int, int]
 
 
+class SenderBitrateAllocator:
+    def __init__(self, target_bitrate_provider: Callable[[], int]) -> None:
+        self.__target_bitrate_provider = target_bitrate_provider
+        self.__senders: dict[int, SenderState] = {}
+        self.__estimates: dict[int, tuple[int, int]] = {}
+        self.__session_target_bitrate: Optional[int] = None
+
+    @property
+    def sender_count(self) -> int:
+        return len(self.__senders)
+
+    @property
+    def states(self) -> list[SenderState]:
+        return list(self.__senders.values())
+
+    def register_sender(self, sender: CongestionControlledSender) -> None:
+        if sender.kind != "video":
+            return
+
+        self.__senders[sender._ssrc] = SenderState(
+            sender=sender,
+            weight=1.0,
+            allocated_bitrate=0,
+            applied_bitrate=None,
+        )
+        self.recompute_allocation()
+
+    def unregister_sender(self, sender: CongestionControlledSender) -> None:
+        self.__senders.pop(sender._ssrc, None)
+        self.__estimates.pop(sender._ssrc, None)
+        self.recompute_allocation()
+
+    def update_receiver_estimate(
+        self, *, bitrate: int, ssrcs: list[int], now_ms: int
+    ) -> bool:
+        for ssrc in ssrcs:
+            if ssrc in self.__senders:
+                self.__estimates[ssrc] = (bitrate, now_ms)
+
+        target = self.__derive_session_target(now_ms)
+        if target is None:
+            return False
+
+        self.__session_target_bitrate = target
+        self.recompute_allocation()
+        return True
+
+    def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
+        state = self.__senders.get(ssrc)
+        if state is None or payload_bytes <= 0:
+            return
+        state.encoded_payload_bytes += payload_bytes
+
+    def sender_trace_allocations(self) -> list[dict[str, int | None]]:
+        return [
+            {
+                "ssrc": ssrc,
+                "allocated_bitrate_bps": state.allocated_bitrate,
+                "applied_bitrate_bps": state.applied_bitrate,
+                "encoder_bitrate_bps": state.sender._get_target_bitrate(),
+            }
+            for ssrc, state in self.__senders.items()
+        ]
+
+    def recompute_allocation(self) -> None:
+        if not self.__senders:
+            return
+
+        states = list(self.__senders.values())
+        session = self.__current_session_target()
+        base_allocation = session // len(states)
+        remainder = session % len(states)
+        for index, state in enumerate(states):
+            state.allocated_bitrate = base_allocation + (1 if index < remainder else 0)
+
+        for state in states:
+            self.__apply_sender_target(state)
+
+    def __derive_session_target(self, now_ms: int) -> Optional[int]:
+        active_ssrcs = list(self.__senders.keys())
+        if not active_ssrcs:
+            return None
+
+        fresh = []
+        for ssrc in active_ssrcs:
+            sample = self.__estimates.get(ssrc)
+            if sample is None:
+                continue
+            bitrate, sample_ms = sample
+            if now_ms - sample_ms <= 1500:
+                fresh.append(bitrate)
+
+        if fresh:
+            return min(fresh)
+
+        if self.__session_target_bitrate is not None:
+            return self.__session_target_bitrate
+
+        return self.__target_bitrate_provider()
+
+    def __current_session_target(self) -> int:
+        if self.__session_target_bitrate is not None:
+            return self.__session_target_bitrate
+        return self.__target_bitrate_provider()
+
+    def __apply_sender_target(self, state: SenderState) -> None:
+        allocated_bitrate = int(state.allocated_bitrate)
+        bitrate = self.__clamp_sender_target(state.sender, allocated_bitrate)
+        is_bound_limited = bitrate != allocated_bitrate
+        current = state.sender._get_target_bitrate()
+        reference_bitrate = current if current is not None else state.applied_bitrate
+        if reference_bitrate == bitrate:
+            state.applied_bitrate = bitrate
+            return
+        if reference_bitrate is not None and not is_bound_limited:
+            delta = abs(bitrate - reference_bitrate)
+            minimum_delta = max(
+                _TARGET_APPLY_MIN_DELTA_BPS,
+                int(reference_bitrate * _TARGET_APPLY_MIN_DELTA_RATIO),
+            )
+            if delta < minimum_delta:
+                return
+        state.sender._set_target_bitrate(bitrate)
+        state.applied_bitrate = state.sender._get_target_bitrate() or bitrate
+
+    def __clamp_sender_target(
+        self, sender: CongestionControlledSender, bitrate: int
+    ) -> int:
+        get_bounds = getattr(sender, "_get_bitrate_bounds", None)
+        if get_bounds is None:
+            return bitrate
+        min_bitrate, max_bitrate = get_bounds()
+        return max(min_bitrate, min(max_bitrate, bitrate))
+
+
 @dataclass(frozen=True)
 class TransportSentPacket:
     transport_sequence_number: int
@@ -270,64 +405,26 @@ class _NullRtpPacer:
 
 class TransportCongestionController:
     """
-    Lightweight transport-scoped overlay congestion controller.
+    Transport-scoped adapter for congestion-control runtime hardpoints.
 
-    This first pass intentionally stays simple:
-    - one controller per DTLS / bundled RTP transport
-    - aggregate receiver REMB feedback at transport scope
-    - allocate a single session target across active video senders
-    - do not pace or drop packets yet
+    aiortc owns sender/receiver registration, bitrate application, and the
+    final RTP/RTCP write path. Congestion-control components install their
+    policy objects into this adapter through generic runtime hooks.
     """
 
-    def __init__(
-        self, congestion_control: list[Any] | tuple[Any, ...] | None = None
-    ) -> None:
-        self.__senders: dict[int, SenderState] = {}
-        self.__estimates: dict[int, tuple[int, int]] = {}
+    def __init__(self) -> None:
         self.__receivers: set[CongestionControlledReceiver] = set()
-        self.__session_target_bitrate: Optional[int] = None
         self.__net_trace_writer = NetTraceWriter.from_environment()
         self.__remb_control = None
         self.__remote_bitrate_estimator = None
         self.__transport_control = _NullTransportControl()
+        self.__bitrate_allocator = SenderBitrateAllocator(
+            self.__transport_control.get_target_bitrate
+        )
         self.__rtp_pacer = _NullRtpPacer()
         self.__has_rtp_pacer = False
         self.__incoming_rtp_handlers: list[IncomingRtpHandler] = []
         self.__rtt_handlers: list[RttHandler] = []
-        for component in tuple(congestion_control or ()):
-            create_remb_receiver = getattr(component, "create_remb_receiver", None)
-            if create_remb_receiver is not None:
-                self.__remb_control = create_remb_receiver(
-                    trace_writer=self.__net_trace_writer
-                )
-                self.__remote_bitrate_estimator = getattr(
-                    self.__remb_control, "estimator", None
-                )
-                self.__incoming_rtp_handlers.append(
-                    self.__observe_incoming_remb
-                )
-                self.__rtt_handlers.append(self.__remb_control.on_round_trip_time)
-
-            create_transport_cc_controller = getattr(
-                component, "create_transport_cc_controller", None
-            )
-            if create_transport_cc_controller is not None:
-                self.__transport_control = create_transport_cc_controller(
-                    trace_writer=self.__net_trace_writer
-                )
-                self.__incoming_rtp_handlers.insert(
-                    0, self.__observe_incoming_transport_cc
-                )
-                self.__rtt_handlers.append(
-                    lambda rtt_ms, controller=self.__transport_control: (
-                        controller.on_round_trip_time(rtt_ms * 1000)
-                    )
-                )
-
-            create_rtp_pacer = getattr(component, "create_rtp_pacer", None)
-            if create_rtp_pacer is not None:
-                self.__rtp_pacer = create_rtp_pacer()
-                self.__has_rtp_pacer = True
         self.__retransmission_rate_limiter = _RateLimiter(
             _RETRANSMISSION_RATE_LIMIT_WINDOW_MS
         )
@@ -339,6 +436,34 @@ class TransportCongestionController:
         self.__last_logged_target_bitrate: Optional[int] = None
         self.__last_logged_delay_usage: Optional[str] = None
 
+    @property
+    def trace_writer(self) -> NetTraceWriter | None:
+        return self.__net_trace_writer
+
+    def set_remb_receiver(self, receiver: object) -> None:
+        self.__remb_control = receiver
+        self.__remote_bitrate_estimator = getattr(receiver, "estimator", None)
+        self.__incoming_rtp_handlers.append(self.__observe_incoming_remb)
+        on_round_trip_time = getattr(receiver, "on_round_trip_time", None)
+        if on_round_trip_time is not None:
+            self.__rtt_handlers.append(on_round_trip_time)
+
+    def set_transport_rate_controller(self, controller: object) -> None:
+        self.__transport_control = controller
+        self.__bitrate_allocator = SenderBitrateAllocator(
+            self.__transport_control.get_target_bitrate
+        )
+        self.__incoming_rtp_handlers.insert(0, self.__observe_incoming_transport_cc)
+        on_round_trip_time = getattr(controller, "on_round_trip_time", None)
+        if on_round_trip_time is not None:
+            self.__rtt_handlers.append(
+                lambda rtt_ms, handler=on_round_trip_time: handler(rtt_ms * 1000)
+            )
+
+    def set_rtp_pacer(self, pacer: object) -> None:
+        self.__rtp_pacer = pacer
+        self.__has_rtp_pacer = True
+
     def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
         if getattr(receiver, "kind", None) == "video":
             self.__receivers.add(receiver)
@@ -347,21 +472,10 @@ class TransportCongestionController:
         self.__receivers.discard(receiver)
 
     def register_sender(self, sender: CongestionControlledSender) -> None:
-        if sender.kind != "video":
-            return
-
-        self.__senders[sender._ssrc] = SenderState(
-            sender=sender,
-            weight=1.0,
-            allocated_bitrate=0,
-            applied_bitrate=None,
-        )
-        self.__recompute_allocation()
+        self.__bitrate_allocator.register_sender(sender)
 
     def unregister_sender(self, sender: CongestionControlledSender) -> None:
-        self.__senders.pop(sender._ssrc, None)
-        self.__estimates.pop(sender._ssrc, None)
-        self.__recompute_allocation()
+        self.__bitrate_allocator.unregister_sender(sender)
 
     def update_receiver_estimate(
         self, bitrate: int, ssrcs: list[int], now_ms: int
@@ -374,10 +488,10 @@ class TransportCongestionController:
                     now_ms=now_ms,
                     accepted=False,
                     reason="transport-cc-active",
-                    sender_count=len(self.__senders),
+                    sender_count=self.__bitrate_allocator.sender_count,
                 )
             return
-        if not self.__senders:
+        if self.__bitrate_allocator.sender_count == 0:
             if self.__net_trace_writer is not None:
                 self.__net_trace_writer.write_remb_receiver_estimate(
                     bitrate=bitrate,
@@ -386,19 +500,16 @@ class TransportCongestionController:
                     accepted=False,
                     reason="no-senders",
                     sender_count=0,
-                )
+            )
             return
 
-        for ssrc in ssrcs:
-            if ssrc in self.__senders:
-                self.__estimates[ssrc] = (bitrate, now_ms)
-
-        target = self.__derive_session_target(now_ms)
-        if target is None:
+        accepted = self.__bitrate_allocator.update_receiver_estimate(
+            bitrate=bitrate,
+            ssrcs=ssrcs,
+            now_ms=now_ms,
+        )
+        if not accepted:
             return
-
-        self.__session_target_bitrate = target
-        self.__recompute_allocation()
         if self.__net_trace_writer is not None:
             self.__net_trace_writer.write_remb_receiver_estimate(
                 bitrate=bitrate,
@@ -406,8 +517,8 @@ class TransportCongestionController:
                 now_ms=now_ms,
                 accepted=True,
                 reason="accepted",
-                sender_count=len(self.__senders),
-                allocations=self.__sender_trace_allocations(),
+                sender_count=self.__bitrate_allocator.sender_count,
+                allocations=self.__bitrate_allocator.sender_trace_allocations(),
             )
 
     def on_rtcp_received(
@@ -487,10 +598,10 @@ class TransportCongestionController:
         )
 
     def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
-        state = self.__senders.get(ssrc)
-        if state is None or payload_bytes <= 0:
-            return
-        state.encoded_payload_bytes += payload_bytes
+        self.__bitrate_allocator.observe_encoded_frame(
+            ssrc=ssrc,
+            payload_bytes=payload_bytes,
+        )
 
     def prepare_rtp(
         self, packet: object, context: RtpSendContext
@@ -549,7 +660,7 @@ class TransportCongestionController:
             feedback, now_us
         )
         if update is not None:
-            self.__recompute_allocation()
+            self.__bitrate_allocator.recompute_allocation()
             self.__log_target_update(previous_target, update)
             self.__trace_target_update(previous_target, update)
         self.__log_delay_usage_transition()
@@ -637,90 +748,6 @@ class TransportCongestionController:
         return [
             RtcpTransportLayerCcPacket(feedback=feedback)
             for feedback in feedback_packets
-        ]
-
-    def __derive_session_target(self, now_ms: int) -> Optional[int]:
-        active_ssrcs = list(self.__senders.keys())
-        if not active_ssrcs:
-            return None
-
-        fresh = []
-        for ssrc in active_ssrcs:
-            sample = self.__estimates.get(ssrc)
-            if sample is None:
-                continue
-            bitrate, sample_ms = sample
-            if now_ms - sample_ms <= 1500:
-                fresh.append(bitrate)
-
-        if fresh:
-            return min(fresh)
-
-        if self.__session_target_bitrate is not None:
-            return self.__session_target_bitrate
-
-        return self.__transport_control.get_target_bitrate()
-
-    def __current_session_target(self) -> int:
-        if (
-            not self.__transport_control.active
-            and self.__session_target_bitrate is not None
-        ):
-            return self.__session_target_bitrate
-        return self.__transport_control.get_target_bitrate()
-
-    def __recompute_allocation(self) -> None:
-        if not self.__senders:
-            return
-
-        states = list(self.__senders.values())
-        session = self.__current_session_target()
-        base_allocation = session // len(states)
-        remainder = session % len(states)
-        for index, state in enumerate(states):
-            state.allocated_bitrate = base_allocation + (1 if index < remainder else 0)
-
-        for state in states:
-            self.__apply_sender_target(state)
-
-    def __apply_sender_target(self, state: SenderState) -> None:
-        allocated_bitrate = int(state.allocated_bitrate)
-        bitrate = self.__clamp_sender_target(state.sender, allocated_bitrate)
-        is_bound_limited = bitrate != allocated_bitrate
-        current = state.sender._get_target_bitrate()
-        reference_bitrate = current if current is not None else state.applied_bitrate
-        if reference_bitrate == bitrate:
-            state.applied_bitrate = bitrate
-            return
-        if reference_bitrate is not None and not is_bound_limited:
-            delta = abs(bitrate - reference_bitrate)
-            minimum_delta = max(
-                _TARGET_APPLY_MIN_DELTA_BPS,
-                int(reference_bitrate * _TARGET_APPLY_MIN_DELTA_RATIO),
-            )
-            if delta < minimum_delta:
-                return
-        state.sender._set_target_bitrate(bitrate)
-        state.applied_bitrate = state.sender._get_target_bitrate() or bitrate
-
-    def __clamp_sender_target(
-        self, sender: CongestionControlledSender, bitrate: int
-    ) -> int:
-        get_bounds = getattr(sender, "_get_bitrate_bounds", None)
-        if get_bounds is None:
-            return bitrate
-        min_bitrate, max_bitrate = get_bounds()
-        return max(min_bitrate, min(max_bitrate, bitrate))
-
-    def __sender_trace_allocations(self) -> list[dict[str, int | None]]:
-        return [
-            {
-                "ssrc": ssrc,
-                "allocated_bitrate_bps": state.allocated_bitrate,
-                "applied_bitrate_bps": state.applied_bitrate,
-                "encoder_bitrate_bps": state.sender._get_target_bitrate(),
-            }
-            for ssrc, state in self.__senders.items()
         ]
 
     def __get_feedback_ssrc(self) -> Optional[int]:
@@ -902,7 +929,7 @@ class TransportCongestionController:
             return
 
         pacer = self.__transport_control.get_pacer_config()
-        states = list(self.__senders.values())
+        states = self.__bitrate_allocator.states
         allocated_total = sum(state.allocated_bitrate for state in states)
         applied_total = sum(
             state.applied_bitrate or 0 for state in states

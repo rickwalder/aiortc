@@ -30,6 +30,7 @@ from .fake_congestion import (
     TRANSPORT_CC_URI,
     FakeRemb,
     FakeTransportCc,
+    install_fake_congestion_components,
 )
 from .utils import asynctest
 
@@ -181,9 +182,14 @@ class TransportControlCapabilitiesTest(TestCase):
 
 
 class TransportCongestionControllerTest(TestCase):
+    def make_controller(self, *components: object) -> TransportCongestionController:
+        controller = TransportCongestionController()
+        install_fake_congestion_components(controller, *components)
+        return controller
+
     def test_incoming_rtp_delegates_to_component_receiver(self) -> None:
         component = FakeTransportCc()
-        controller = TransportCongestionController([component])
+        controller = self.make_controller(component)
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
 
@@ -203,7 +209,7 @@ class TransportCongestionControllerTest(TestCase):
     def test_incoming_remb_suppressed_once_transport_component_active(self) -> None:
         remb = FakeRemb()
         transport_cc = FakeTransportCc()
-        controller = TransportCongestionController([remb, transport_cc])
+        controller = self.make_controller(remb, transport_cc)
         receiver = DummyReceiver()
         controller.register_receiver(receiver)
 
@@ -238,7 +244,7 @@ class TransportCongestionControllerTest(TestCase):
     def test_incoming_remb_writes_separate_trace(self) -> None:
         with tempfile.NamedTemporaryFile() as fp:
             with patch.dict(os.environ, {"AIORTC_NET_TRACE": fp.name}):
-                controller = TransportCongestionController([FakeRemb()])
+                controller = self.make_controller(FakeRemb())
             receiver = DummyReceiver()
             controller.register_receiver(receiver)
 
@@ -276,7 +282,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.target_bitrate, 1_000_000)
 
     def test_small_receiver_estimate_changes_do_not_reconfigure_sender(self) -> None:
-        controller = TransportCongestionController([FakeTransportCc()])
+        controller = self.make_controller(FakeTransportCc())
         sender = DummySender(ssrc=1234)
         controller.register_sender(sender)
 
@@ -299,7 +305,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.applied_bitrates[-2:], [3_000_000, 3_040_000])
 
     def test_sender_target_application_respects_sender_bounds(self) -> None:
-        controller = TransportCongestionController([FakeTransportCc()])
+        controller = self.make_controller(FakeTransportCc())
         sender = DummyBoundedSender(ssrc=1234)
         controller.register_sender(sender)
 
@@ -318,7 +324,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.applied_bitrates, [3_000_000])
 
     def test_sender_target_application_snaps_to_bound_within_hysteresis(self) -> None:
-        controller = TransportCongestionController([FakeTransportCc()])
+        controller = self.make_controller(FakeTransportCc())
         sender = DummyBoundedSender(ssrc=1234, target_bitrate=2_980_000)
         controller.register_sender(sender)
         sender.target_bitrate = 2_980_000
@@ -336,7 +342,7 @@ class TransportCongestionControllerTest(TestCase):
     @asynctest
     async def test_pace_rtp_packet_uses_configured_component_pacer(self) -> None:
         component = FakeTransportCc()
-        controller = TransportCongestionController([component])
+        controller = self.make_controller(component)
 
         await controller.pace_rtp_packet(size_bytes=1200, now_ms=100)
         await controller.pace_rtp_packet(size_bytes=1200, now_ms=100)
@@ -344,7 +350,7 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(component.pacer.paced_sizes, [1200, 1200])
 
     def test_retransmission_rate_limiter_uses_transport_target_window(self) -> None:
-        controller = TransportCongestionController([FakeTransportCc()])
+        controller = self.make_controller(FakeTransportCc())
 
         self.assertTrue(
             controller.allow_retransmission(size_bytes=450_000, now_ms=0)
@@ -357,7 +363,7 @@ class TransportCongestionControllerTest(TestCase):
         )
 
     def test_initial_allocation_splits_transport_target_evenly(self) -> None:
-        controller = TransportCongestionController([FakeTransportCc()])
+        controller = self.make_controller(FakeTransportCc())
         senders = [DummySender(1000 + i) for i in range(3)]
 
         for sender in senders:

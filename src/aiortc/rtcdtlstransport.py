@@ -7,7 +7,7 @@ import os
 import traceback
 from collections import deque
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional, Protocol, Type, TypeVar, Union
+from typing import Optional, Protocol, Type, TypeVar, Union
 
 import pylibsrtp
 from cryptography import x509
@@ -21,6 +21,8 @@ from pyrtcp import RtcpPacketRegistry
 from rtc_types import (
     RtcpReceiveContext,
     RtcpReceiveObserver,
+    RtcRuntimeComponent,
+    RtcRuntimeContributions,
     RtpReceiveContext,
     RtpReceiveObserver,
     RtpSendContext,
@@ -392,6 +394,11 @@ class RtpRouter:
                 d.pop(k)
 
 
+@dataclass(frozen=True)
+class AiortcRuntimeContext:
+    trace_writer: object | None
+
+
 class RTCDtlsTransport(AsyncIOEventEmitter):
     """
     The :class:`RTCDtlsTransport` object includes information relating to
@@ -407,7 +414,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         transport: RTCIceTransport,
         certificates: list[RTCCertificate],
         *,
-        congestion_control: list[Any] | tuple[Any, ...] | None = None,
+        congestion_control: (
+            list[RtcRuntimeComponent] | tuple[RtcRuntimeComponent, ...] | None
+        ) = None,
     ) -> None:
         assert len(certificates) == 1
         certificate = certificates[0]
@@ -422,17 +431,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue: deque[_QueuedRtpPacket] = deque()
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
-        congestion_control_components = tuple(congestion_control or ())
         self._rtcp_packet_registry = RtcpPacketRegistry()
-        for component in congestion_control_components:
-            rtcp_codecs = getattr(component, "rtcp_codecs", None)
-            if rtcp_codecs is None:
-                continue
-            for codec in rtcp_codecs():
-                self._rtcp_packet_registry.register(codec)
-        self._congestion_controller = TransportCongestionController(
-            congestion_control_components
-        )
+        self._congestion_controller = TransportCongestionController()
         self._rtcp_receive_handlers: list[RtcpReceiveObserver] = [
             self._congestion_controller
         ]
@@ -445,19 +445,13 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_receive_observers: list[RtpReceiveObserver] = [
             self._congestion_controller
         ]
-        for component in congestion_control_components:
-            rtcp_receive_handlers = getattr(component, "rtcp_receive_handlers", None)
-            if rtcp_receive_handlers is not None:
-                self._rtcp_receive_handlers.extend(rtcp_receive_handlers())
-            rtp_send_interceptors = getattr(component, "rtp_send_interceptors", None)
-            if rtp_send_interceptors is not None:
-                self._rtp_send_interceptors.extend(rtp_send_interceptors())
-            rtp_sent_observers = getattr(component, "rtp_sent_observers", None)
-            if rtp_sent_observers is not None:
-                self._rtp_sent_observers.extend(rtp_sent_observers())
-            rtp_receive_observers = getattr(component, "rtp_receive_observers", None)
-            if rtp_receive_observers is not None:
-                self._rtp_receive_observers.extend(rtp_receive_observers())
+        runtime_context = AiortcRuntimeContext(
+            trace_writer=self._congestion_controller.trace_writer
+        )
+        for component in tuple(congestion_control or ()):
+            self._add_runtime_contributions(
+                component.runtime_contributions(runtime_context)
+            )
         self._rtp_pacer_task: Optional[asyncio.Future[None]] = None
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
@@ -478,6 +472,24 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._srtp_profiles = SRTP_PROFILES
         self._ssl: Optional[SSL.Connection] = None
         self.__local_certificate = certificate
+
+    def _add_runtime_contributions(
+        self, contributions: RtcRuntimeContributions
+    ) -> None:
+        for codec in contributions.rtcp_codecs:
+            self._rtcp_packet_registry.register(codec)
+        self._rtcp_receive_handlers.extend(contributions.rtcp_receive_observers)
+        self._rtp_send_interceptors.extend(contributions.rtp_send_interceptors)
+        self._rtp_sent_observers.extend(contributions.rtp_sent_observers)
+        self._rtp_receive_observers.extend(contributions.rtp_receive_observers)
+        if contributions.rtp_pacer is not None:
+            self._congestion_controller.set_rtp_pacer(contributions.rtp_pacer)
+        if contributions.remb_receiver is not None:
+            self._congestion_controller.set_remb_receiver(contributions.remb_receiver)
+        if contributions.transport_rate_controller is not None:
+            self._congestion_controller.set_transport_rate_controller(
+                contributions.transport_rate_controller
+            )
 
     @property
     def state(self) -> str:
@@ -1053,14 +1065,15 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
-            if not self._prepare_rtp_packet(
+            send_decision = self._prepare_rtp_packet(
                 packet,
                 extensions_map,
                 is_video=True,
                 payload_size_bytes=0,
                 is_retransmission=False,
                 is_probe=True,
-            ):
+            )
+            if send_decision.drop_packet:
                 return False
             if packet.extensions.transport_sequence_number is None:
                 return False

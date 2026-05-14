@@ -34,7 +34,11 @@ from aiortc.stats import RTCStatsReport
 
 from tests.test_mediastreams import VideoPacketStreamTrack
 
-from .fake_congestion import TRANSPORT_CC_URI, FakeTransportCc
+from .fake_congestion import (
+    TRANSPORT_CC_URI,
+    FakeTransportCc,
+    install_fake_congestion_components,
+)
 from .utils import ClosedDtlsTransport, asynctest, dummy_dtls_transport_pair
 
 VP8_CODEC = RTCRtpCodecParameters(
@@ -317,8 +321,10 @@ class RTCRtpSenderTest(TestCase):
         async with dummy_dtls_transport_pair() as (local_transport, _):
             local_transport._send_rtp = mock_send_rtp  # type: ignore
             component = FakeTransportCc()
-            local_transport._congestion_controller = TransportCongestionController(
-                [component]
+            local_transport._congestion_controller = TransportCongestionController()
+            install_fake_congestion_components(
+                local_transport._congestion_controller,
+                component,
             )
             local_transport._rtp_send_interceptors = [
                 local_transport._congestion_controller

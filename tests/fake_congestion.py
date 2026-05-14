@@ -9,8 +9,34 @@ from rtc_types import (
     RtcCapabilities,
     RtcpFeedbackCapability,
     RtcpFeedbackPacketCapability,
+    RtcRuntimeContext,
+    RtcRuntimeContributions,
     RtpHeaderExtensionCapability,
 )
+
+
+def install_fake_congestion_components(controller: object, *components: object) -> None:
+    context = FakeRuntimeContext(controller)
+    for component in components:
+        contributions = component.runtime_contributions(context)
+        if contributions.remb_receiver is not None:
+            controller.set_remb_receiver(contributions.remb_receiver)
+        if contributions.transport_rate_controller is not None:
+            controller.set_transport_rate_controller(
+                contributions.transport_rate_controller
+            )
+        if contributions.rtp_pacer is not None:
+            controller.set_rtp_pacer(contributions.rtp_pacer)
+
+
+class FakeRuntimeContext:
+    def __init__(self, controller: object) -> None:
+        self.controller = controller
+        self.rtcp_codecs: list[object] = []
+
+    @property
+    def trace_writer(self) -> object | None:
+        return getattr(self.controller, "trace_writer", None)
 
 ABS_SEND_TIME_URI = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
 ABS_SEND_TIME_HEADER_EXTENSION_ID = 3
@@ -301,8 +327,10 @@ class FakeRemb:
             ],
         )
 
-    def create_remb_receiver(self, *, trace_writer=None) -> FakeRembReceiver:
-        return self.receiver
+    def runtime_contributions(
+        self, context: RtcRuntimeContext
+    ) -> RtcRuntimeContributions:
+        return RtcRuntimeContributions(remb_receiver=self.receiver)
 
 
 class FakeTransportCc:
@@ -331,13 +359,11 @@ class FakeTransportCc:
             ],
         )
 
-    def create_transport_cc_controller(
-        self, *, trace_writer=None
-    ) -> FakeTransportController:
-        return self.controller
-
-    def create_rtp_pacer(self) -> FakeRtpPacer:
-        return self.pacer
-
-    def rtcp_codecs(self) -> tuple[FakeTwccRtcpCodec, ...]:
-        return (FakeTwccRtcpCodec(),)
+    def runtime_contributions(
+        self, context: RtcRuntimeContext
+    ) -> RtcRuntimeContributions:
+        return RtcRuntimeContributions(
+            transport_rate_controller=self.controller,
+            rtp_pacer=self.pacer,
+            rtcp_codecs=[FakeTwccRtcpCodec()],
+        )
