@@ -77,7 +77,7 @@ select = [
 known-third-party = ["aiortc"]
 
 [tool.uv.sources]
-pycc = { git = "ssh://git@github.com/Weave-Robotics/pycc.git", rev = "main" }
+pycc = { git = "ssh://git@github.com/Weave-Robotics/pycc.git", rev = "dev/modularize" }
 pyRTCP = { git = "ssh://git@github.com/Weave-Robotics/pyrtcp.git", rev = "main" }
 rtc-types = { git = "ssh://git@github.com/Weave-Robotics/rtc-types.git", rev = "main" }
 
