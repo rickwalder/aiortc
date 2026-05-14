@@ -4,8 +4,9 @@ import json
 import logging
 import os
 import platform
+import random
 import ssl
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from aiohttp import web
 from aiortc import (
@@ -15,9 +16,11 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.contrib.media import MediaPlayer, MediaRelay
+from aiortc.rtp import is_rtcp
 
 ROOT = os.path.dirname(__file__)
 
+logger = logging.getLogger("webcam")
 pcs = set()
 relay = None
 webcam = None
@@ -63,6 +66,62 @@ def force_codec(pc: RTCPeerConnection, sender: RTCRtpSender, forced_codec: str) 
     )
 
 
+def install_outbound_rtp_loss(
+    sender: RTCRtpSender,
+    *,
+    loss_percent: float,
+    start_after: float,
+    duration: Optional[float],
+    seed: Optional[int],
+) -> None:
+    if loss_percent <= 0:
+        return
+
+    original_send_rtp: Callable[[bytes], Awaitable[None]] = sender.transport._send_rtp
+    random_source = random.Random(seed)
+    drop_probability = loss_percent / 100
+    first_rtp_time: Optional[float] = None
+    packets = 0
+    dropped = 0
+
+    async def send_rtp_with_loss(data: bytes) -> None:
+        nonlocal dropped, first_rtp_time, packets
+
+        if is_rtcp(data):
+            await original_send_rtp(data)
+            return
+
+        loop_time = asyncio.get_running_loop().time()
+        if first_rtp_time is None:
+            first_rtp_time = loop_time
+        elapsed = loop_time - first_rtp_time
+        active = elapsed >= start_after and (
+            duration is None or elapsed < start_after + duration
+        )
+
+        packets += 1
+        if active and random_source.random() < drop_probability:
+            dropped += 1
+            if dropped <= 10 or dropped % 50 == 0:
+                logger.info(
+                    "dropping outbound RTP packet %d/%d at %.3fs",
+                    dropped,
+                    packets,
+                    elapsed,
+                )
+            return
+
+        await original_send_rtp(data)
+
+    sender.transport._send_rtp = send_rtp_with_loss  # type: ignore[method-assign]
+    logger.info(
+        "installed outbound RTP loss: %.2f%% after %.2fs for %s",
+        loss_percent,
+        start_after,
+        "the rest of the call" if duration is None else f"{duration:.2f}s",
+    )
+
+
 async def index(request: web.Request) -> web.Response:
     content = open(os.path.join(ROOT, "index.html"), "r").read()
     return web.Response(content_type="text/html", text=content)
@@ -105,6 +164,13 @@ async def offer(request: web.Request) -> web.Response:
             force_codec(pc, video_sender, args.video_codec)
         elif args.play_without_decoding:
             raise Exception("You must specify the video codec using --video-codec")
+        install_outbound_rtp_loss(
+            video_sender,
+            loss_percent=args.video_loss_percent,
+            start_after=args.video_loss_start,
+            duration=args.video_loss_duration,
+            seed=args.video_loss_seed,
+        )
 
     await pc.setRemoteDescription(offer)
 
@@ -155,6 +221,28 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--video-codec", help="Force a specific video codec (e.g. video/H264)"
+    )
+    parser.add_argument(
+        "--video-loss-percent",
+        type=float,
+        default=0.0,
+        help="Drop this percentage of outbound video RTP packets",
+    )
+    parser.add_argument(
+        "--video-loss-start",
+        type=float,
+        default=5.0,
+        help="Start dropping outbound video RTP this many seconds after first RTP",
+    )
+    parser.add_argument(
+        "--video-loss-duration",
+        type=float,
+        help="Stop dropping outbound video RTP after this many seconds",
+    )
+    parser.add_argument(
+        "--video-loss-seed",
+        type=int,
+        help="Seed for deterministic outbound video RTP loss",
     )
 
     args = parser.parse_args()

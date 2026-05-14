@@ -9,6 +9,8 @@
 /build
 /dist
 /docs/_build
+reference-materials-dont-commit/
+data-dont-commit/
 
 # Environments
 .env
@@ -18,3 +20,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+*.log
+*.jsonl

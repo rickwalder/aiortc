@@ -6,8 +6,15 @@ from struct import pack, unpack, unpack_from
 from typing import Any, Optional, Union
 
 from av import AudioFrame
+from pycc import (
+    RTPFB_TRANSPORT_CC_FMT,
+    TransportLayerCcPacket,
+    parse_transport_layer_cc,
+    serialize_transport_layer_cc,
+)
 
 from .rtcrtpparameters import RTCRtpParameters
+from .transportcontrol import TRANSPORT_CC_URI
 
 # used for NACK and retransmission
 RTP_HISTORY_SIZE = 128
@@ -30,6 +37,7 @@ RTCP_RTPFB = 205
 RTCP_PSFB = 206
 
 RTCP_RTPFB_NACK = 1
+RTCP_RTPFB_TRANSPORT_CC = RTPFB_TRANSPORT_CC_FMT
 
 RTCP_PSFB_PLI = 1
 RTCP_PSFB_SLI = 2
@@ -53,6 +61,10 @@ class HeaderExtensionsMap:
     def __init__(self) -> None:
         self.__ids = HeaderExtensions()
 
+    @property
+    def has_transport_sequence_number(self) -> bool:
+        return self.__ids.transport_sequence_number is not None
+
     def configure(self, parameters: RTCRtpParameters) -> None:
         for ext in parameters.headerExtensions:
             if ext.uri == "urn:ietf:params:rtp-hdrext:sdes:mid":
@@ -69,10 +81,7 @@ class HeaderExtensionsMap:
                 self.__ids.transmission_offset = ext.id
             elif ext.uri == "urn:ietf:params:rtp-hdrext:ssrc-audio-level":
                 self.__ids.audio_level = ext.id
-            elif (
-                ext.uri
-                == "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
-            ):
+            elif ext.uri == TRANSPORT_CC_URI:
                 self.__ids.transport_sequence_number = ext.id
 
     def get(self, extension_profile: int, extension_value: bytes) -> HeaderExtensions:
@@ -514,6 +523,41 @@ class RtcpRtpfbPacket:
 
 
 @dataclass
+class RtcpTransportLayerCcPacket:
+    """
+    Transport-wide congestion-control feedback (draft-holmer transport-cc).
+    """
+
+    feedback: TransportLayerCcPacket
+
+    @property
+    def fmt(self) -> int:
+        return RTCP_RTPFB_TRANSPORT_CC
+
+    @property
+    def ssrc(self) -> int:
+        return self.feedback.sender_ssrc
+
+    @property
+    def media_ssrc(self) -> int:
+        return self.feedback.media_ssrc
+
+    def __bytes__(self) -> bytes:
+        return serialize_transport_layer_cc(self.feedback)
+
+    @classmethod
+    def parse(cls, data: bytes, fmt: int) -> "RtcpTransportLayerCcPacket":
+        if fmt != RTCP_RTPFB_TRANSPORT_CC:
+            raise ValueError("RTCP RTP feedback type is not transport-cc")
+        if len(data) < 16:
+            raise ValueError("RTCP transport feedback length is invalid")
+        data += b"\x00" * padl(len(data))
+        return cls(
+            feedback=parse_transport_layer_cc(pack_rtcp_packet(RTCP_RTPFB, fmt, data))
+        )
+
+
+@dataclass
 class RtcpSdesPacket:
     chunks: list[RtcpSourceInfo] = field(default_factory=list)
 
@@ -588,6 +632,7 @@ AnyRtcpPacket = Union[
     RtcpPsfbPacket,
     RtcpRrPacket,
     RtcpRtpfbPacket,
+    RtcpTransportLayerCcPacket,
     RtcpSdesPacket,
     RtcpSrPacket,
 ]
@@ -633,7 +678,10 @@ class RtcpPacket:
             elif packet_type == RTCP_RR:
                 packets.append(RtcpRrPacket.parse(payload, count))
             elif packet_type == RTCP_RTPFB:
-                packets.append(RtcpRtpfbPacket.parse(payload, count))
+                if count == RTCP_RTPFB_TRANSPORT_CC:
+                    packets.append(RtcpTransportLayerCcPacket.parse(payload, count))
+                else:
+                    packets.append(RtcpRtpfbPacket.parse(payload, count))
             elif packet_type == RTCP_PSFB:
                 packets.append(RtcpPsfbPacket.parse(payload, count))
 
