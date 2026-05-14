@@ -13,6 +13,7 @@ from aiortc.rtcrtpparameters import (
     RTCRtpCodecCapability,
     RTCRtpCodecParameters,
     RTCRtpHeaderExtensionCapability,
+    RTCRtpHeaderExtensionParameters,
     RTCRtpSendParameters,
 )
 from aiortc.rtcrtpsender import RTCRtpSender
@@ -30,10 +31,10 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from aiortc.stats import RTCStatsReport
-from pycc import TransportCc
 
 from tests.test_mediastreams import VideoPacketStreamTrack
 
+from .fake_congestion import TRANSPORT_CC_URI, FakeTransportCc
 from .utils import ClosedDtlsTransport, asynctest, dummy_dtls_transport_pair
 
 VP8_CODEC = RTCRtpCodecParameters(
@@ -315,21 +316,35 @@ class RTCRtpSenderTest(TestCase):
 
         async with dummy_dtls_transport_pair() as (local_transport, _):
             local_transport._send_rtp = mock_send_rtp  # type: ignore
+            component = FakeTransportCc()
             local_transport._congestion_controller = TransportCongestionController(
-                [TransportCc()]
+                [component]
+            )
+            local_transport._rtp_send_interceptors = [
+                local_transport._congestion_controller
+            ]
+            local_transport._rtp_sent_observers = [
+                local_transport._congestion_controller
+            ]
+            component.pacer.pace = AsyncMock(wraps=component.pacer.pace)
+
+            sender = RTCRtpSender(VideoStreamTrack(), local_transport)
+            await sender.send(
+                RTCRtpSendParameters(
+                    codecs=[VP8_CODEC],
+                    headerExtensions=[
+                        RTCRtpHeaderExtensionParameters(
+                            id=5,
+                            uri=TRANSPORT_CC_URI,
+                        )
+                    ],
+                )
             )
 
-            with patch(
-                "pycc.runtime.AsyncRtpPacer.pace",
-                new_callable=AsyncMock,
-            ) as mock_pace:
-                sender = RTCRtpSender(VideoStreamTrack(), local_transport)
-                await sender.send(RTCRtpSendParameters(codecs=[VP8_CODEC]))
+            await queue.get()
+            await sender.stop()
 
-                await queue.get()
-                await sender.stop()
-
-        self.assertGreater(mock_pace.await_count, 0)
+        self.assertGreater(component.pacer.pace.await_count, 0)
 
     @asynctest
     async def test_handle_encoded_packet(self) -> None:

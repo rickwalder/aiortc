@@ -24,6 +24,7 @@ from rtc_types import (
     RtpReceiveContext,
     RtpReceiveObserver,
     RtpSendContext,
+    RtpSendDecision,
     RtpSendInterceptor,
     RtpSentContext,
     RtpSentObserver,
@@ -847,7 +848,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         payload_size_bytes: int,
         is_retransmission: bool,
         is_probe: bool = False,
-    ) -> bool:
+    ) -> RtpSendDecision:
         context = RtpSendContext(
             now_us=clock.current_monotonic_us(),
             is_video=is_video,
@@ -858,13 +859,19 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 extensions_map.has_transport_sequence_number
             ),
         )
+        combined_decision = RtpSendDecision()
         for interceptor in self._rtp_send_interceptors:
             decision = interceptor.prepare_rtp(packet, context)
             if decision.drop_packet:
-                return False
+                return decision
+            combined_decision = RtpSendDecision(
+                continue_pipeline=decision.continue_pipeline,
+                drop_packet=False,
+                pace_packet=combined_decision.pace_packet or decision.pace_packet,
+            )
             if not decision.continue_pipeline:
                 break
-        return True
+        return combined_decision
 
     def _notify_rtp_sent(
         self,
@@ -896,15 +903,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
     ) -> None:
         packet = _clone_rtp_packet(packet)
 
-        if is_video:
-            await self._enqueue_rtp_packet(
-                packet,
-                extensions_map,
-                payload_size_bytes=payload_size_bytes,
-                is_retransmission=is_retransmission,
-            )
-            return
-
         async with self._rtp_send_lock:
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
@@ -913,18 +911,35 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 is_retransmission
                 and not self._congestion_controller.allow_retransmission(
                     size_bytes=len(packet.serialize(extensions_map))
+                    + (8 if is_video else 0)
                 )
             ):
                 return
-            if not self._prepare_rtp_packet(
+            send_decision = self._prepare_rtp_packet(
                 packet,
                 extensions_map,
                 is_video=is_video,
                 payload_size_bytes=payload_size_bytes,
                 is_retransmission=is_retransmission,
-            ):
+            )
+            if send_decision.drop_packet:
                 return
             packet_bytes = packet.serialize(extensions_map)
+            if send_decision.pace_packet:
+                queued = _QueuedRtpPacket(
+                    packet=packet,
+                    extensions_map=extensions_map,
+                    size_bytes=len(packet_bytes),
+                    payload_size_bytes=payload_size_bytes,
+                    is_retransmission=is_retransmission,
+                    enqueued_time_us=clock.current_monotonic_us(),
+                )
+                self._rtp_queue.append(queued)
+                self._rtp_queue_bytes += queued.size_bytes
+                self._update_rtp_queue_state()
+                self._rtp_queue_event.set()
+                return
+
             await self._send_rtp(packet_bytes)
             self._notify_rtp_sent(
                 packet,
@@ -932,47 +947,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 payload_size_bytes=payload_size_bytes,
                 is_retransmission=is_retransmission,
             )
-
-    async def _enqueue_rtp_packet(
-        self,
-        packet: RtpPacket,
-        extensions_map: rtp.HeaderExtensionsMap,
-        *,
-        payload_size_bytes: int = 0,
-        is_retransmission: bool = False,
-    ) -> None:
-        async with self._rtp_send_lock:
-            packet.extensions.abs_send_time = (
-                clock.current_ntp_time() >> 14
-            ) & 0x00FFFFFF
-            if is_retransmission:
-                estimated_size_bytes = len(packet.serialize(extensions_map)) + 8
-                if not self._congestion_controller.allow_retransmission(
-                    size_bytes=estimated_size_bytes
-                ):
-                    return
-
-            if not self._prepare_rtp_packet(
-                packet,
-                extensions_map,
-                is_video=True,
-                payload_size_bytes=payload_size_bytes,
-                is_retransmission=is_retransmission,
-            ):
-                return
-            packet_bytes = packet.serialize(extensions_map)
-            queued = _QueuedRtpPacket(
-                packet=packet,
-                extensions_map=extensions_map,
-                size_bytes=len(packet_bytes),
-                payload_size_bytes=payload_size_bytes,
-                is_retransmission=is_retransmission,
-                enqueued_time_us=clock.current_monotonic_us(),
-            )
-            self._rtp_queue.append(queued)
-            self._rtp_queue_bytes += queued.size_bytes
-            self._update_rtp_queue_state()
-            self._rtp_queue_event.set()
 
     async def _send_next_rtp_packet_from_queue(self) -> bool:
         if not self._rtp_queue:

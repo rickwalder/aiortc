@@ -7,13 +7,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
-from pycc import (
-    PacedPacketInfo,
-    PacerConfig,
-    RembFeedback,
-    TransportControlSentPacket,
-    TransportControlTelemetry,
-)
 from rtc_types import (
     RtcpReceiveContext,
     RtpReceiveContext,
@@ -102,6 +95,92 @@ class TelemetrySnapshot:
     encoded_payload_bytes_by_ssrc: dict[int, int]
 
 
+@dataclass(frozen=True)
+class TransportSentPacket:
+    transport_sequence_number: int
+    send_time_us: int
+    size_bytes: int
+    ssrc: int
+    rtp_sequence_number: int
+    payload_size_bytes: int = 0
+    is_retransmission: bool = False
+    pacing_info: Any | None = None
+
+
+@dataclass(frozen=True)
+class _NullPacerConfig:
+    send_bitrate_bps: int = 0
+    probe_cluster: Any | None = None
+
+
+@dataclass(frozen=True)
+class _NullPacedPacketInfo:
+    probe_cluster_id: int = -1
+
+    @property
+    def is_probe(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True)
+class _NullTransportTelemetry:
+    feedback_count: int = 0
+    packet_count: int = 0
+    received_count: int = 0
+    lost_count: int = 0
+    first_time_lost_count: int = 0
+    recovered_count: int = 0
+    sent_packet_count: int = 0
+    sent_bytes: int = 0
+    acknowledged_bytes: int = 0
+    lost_bytes: int = 0
+    prior_unacked_bytes: int = 0
+    data_in_flight_bytes: int = 0
+    pacing_queue_bytes: int = 0
+    pacing_queue_oldest_age_ms: int = 0
+    oldest_in_flight_age_ms: int = 0
+    packet_history_size: int = 0
+    next_transport_sequence_number: int = 0
+    last_feedback_base_sequence_number: int = 0
+    last_feedback_packet_count: int = 0
+    last_feedback_time_us: int = 0
+    last_target_bitrate_bps: int = 7_500_000
+    last_update_reason: str = ""
+    last_loss_fraction: float = 0.0
+    last_rtt_us: int = 0
+    delay_usage: str = "normal"
+    aimd_state: str = "increase"
+    acked_bitrate_bps: int = 0
+    in_alr: bool = False
+    alr_budget_ratio: float = 0.0
+    link_capacity_bps: int = 0
+    link_capacity_lower_bps: int = 0
+    link_capacity_upper_bps: int = 0
+    loss_sample: float = 0.0
+    loss_average: float = 0.0
+    trend_ms: float = 0.0
+    raw_trend: float = 0.0
+    accumulated_delay_ms: float = 0.0
+    smoothed_delay_ms: float = 0.0
+    trend_window_ms: float = 0.0
+    trend_threshold_ms: float = 0.0
+    overuse_counter: int = 0
+    overuse_time_ms: float = 0.0
+    groups_seen: int = 0
+    last_group_bytes: int = 0
+    last_send_delta_ms: float = 0.0
+    last_receive_delta_ms: float = 0.0
+    last_delay_delta_ms: float = 0.0
+    pre_pushback_target_bitrate_bps: int = 0
+    pushback_target_bitrate_bps: int = 0
+    congestion_window_bytes: int = 0
+    congestion_window_fill_ratio: float = 0.0
+    pushback_encoding_rate_ratio: float = 1.0
+    probe_cluster_id: int = -1
+    probe_target_bitrate_bps: int = 0
+    last_probe_bitrate_bps: int = 0
+
+
 class _RateLimiter:
     def __init__(self, window_ms: int) -> None:
         self.__window_ms = window_ms
@@ -144,7 +223,7 @@ class _NullTransportControl:
     def next_transport_sequence_number(self) -> int:
         return 0
 
-    def on_packet_sent(self, packet: TransportControlSentPacket) -> None:
+    def on_packet_sent(self, packet: TransportSentPacket) -> None:
         pass
 
     def observe_incoming_rtp(
@@ -160,8 +239,8 @@ class _NullTransportControl:
     def handle_transport_feedback(self, packet: Any, feedback_time_us: int) -> None:
         return None
 
-    def get_pacer_config(self) -> PacerConfig:
-        return PacerConfig(send_bitrate_bps=0)
+    def get_pacer_config(self) -> _NullPacerConfig:
+        return _NullPacerConfig()
 
     def get_target_bitrate(self) -> int:
         return 7_500_000
@@ -171,8 +250,8 @@ class _NullTransportControl:
     ) -> None:
         pass
 
-    def get_telemetry(self) -> TransportControlTelemetry:
-        return TransportControlTelemetry(last_target_bitrate_bps=7_500_000)
+    def get_telemetry(self) -> _NullTransportTelemetry:
+        return _NullTransportTelemetry()
 
 
 class _NullRtpPacer:
@@ -180,12 +259,12 @@ class _NullRtpPacer:
         self,
         *,
         size_bytes: int,
-        config: PacerConfig,
+        config: Any,
         now_ms: int | None = None,
-    ) -> PacedPacketInfo:
-        return PacedPacketInfo()
+    ) -> _NullPacedPacketInfo:
+        return _NullPacedPacketInfo()
 
-    def is_probe_pending(self, config: PacerConfig) -> bool:
+    def is_probe_pending(self, config: Any) -> bool:
         return False
 
 
@@ -212,6 +291,7 @@ class TransportCongestionController:
         self.__remote_bitrate_estimator = None
         self.__transport_control = _NullTransportControl()
         self.__rtp_pacer = _NullRtpPacer()
+        self.__has_rtp_pacer = False
         self.__incoming_rtp_handlers: list[IncomingRtpHandler] = []
         self.__rtt_handlers: list[RttHandler] = []
         for component in tuple(congestion_control or ()):
@@ -247,6 +327,7 @@ class TransportCongestionController:
             create_rtp_pacer = getattr(component, "create_rtp_pacer", None)
             if create_rtp_pacer is not None:
                 self.__rtp_pacer = create_rtp_pacer()
+                self.__has_rtp_pacer = True
         self.__retransmission_rate_limiter = _RateLimiter(
             _RETRANSMISSION_RATE_LIMIT_WINDOW_MS
         )
@@ -387,13 +468,13 @@ class TransportCongestionController:
         ssrc: int,
         rtp_sequence_number: int,
         is_retransmission: bool = False,
-        pacing_info: Optional[PacedPacketInfo] = None,
+        pacing_info: Any | None = None,
     ) -> None:
         if is_retransmission:
             self.__retransmission_sent_bytes += max(0, size_bytes)
         self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
         self.__transport_control.on_packet_sent(
-            TransportControlSentPacket(
+            TransportSentPacket(
                 transport_sequence_number=transport_sequence_number,
                 send_time_us=send_time_us,
                 size_bytes=size_bytes,
@@ -415,20 +496,23 @@ class TransportCongestionController:
         self, packet: object, context: RtpSendContext
     ) -> RtpSendDecision:
         packet_extensions = getattr(packet, "extensions", None)
-        if (
+        should_use_transport_sequence_number = (
             context.is_video
             and context.supports_transport_sequence_number
-            and getattr(
-                packet_extensions,
-                "transport_sequence_number",
-                None,
-            )
-            is None
+        )
+        if (
+            should_use_transport_sequence_number
+            and getattr(packet_extensions, "transport_sequence_number", None) is None
         ):
             packet_extensions.transport_sequence_number = (
                 self.next_transport_sequence_number()
             )
-        return RtpSendDecision()
+        return RtpSendDecision(
+            pace_packet=(
+                self.__has_rtp_pacer
+                and should_use_transport_sequence_number
+            )
+        )
 
     def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
         transport_sequence_number = getattr(
@@ -488,7 +572,7 @@ class TransportCongestionController:
 
     async def pace_rtp_packet(
         self, *, size_bytes: int, now_ms: Optional[int] = None
-    ) -> PacedPacketInfo:
+    ) -> Any:
         return await self.__rtp_pacer.pace(
             size_bytes=size_bytes,
             config=self.__transport_control.get_pacer_config(),
@@ -526,7 +610,7 @@ class TransportCongestionController:
                 feedback.append(self.__make_remb_packet(remb_feedback))
         return feedback
 
-    def __make_remb_packet(self, feedback: RembFeedback) -> RtcpPsfbPacket:
+    def __make_remb_packet(self, feedback: Any) -> RtcpPsfbPacket:
         return RtcpPsfbPacket(
             fmt=RTCP_PSFB_APP,
             ssrc=feedback.feedback_ssrc,

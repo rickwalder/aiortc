@@ -26,9 +26,13 @@ from aiortc.rtp import (
     wrap_rtx,
 )
 from av import AudioFrame
-from pycc import TransportLayerCcPacket, TwccPacketStatus, TwccRtcpCodec
 from pyrtcp import RtcpPacketRegistry
 
+from .fake_congestion import (
+    RTPFB_TRANSPORT_CC_FMT,
+    FakeTransportFeedback,
+    FakeTwccRtcpCodec,
+)
 from .utils import TestCase, load
 
 
@@ -54,7 +58,7 @@ def create_audio_frame(
 
 class RtcpPacketTest(TestCase):
     def twcc_registry(self) -> RtcpPacketRegistry:
-        return RtcpPacketRegistry([TwccRtcpCodec()])
+        return RtcpPacketRegistry([FakeTwccRtcpCodec()])
 
     def test_bye(self) -> None:
         data = load("rtcp_bye.bin")
@@ -232,54 +236,35 @@ class RtcpPacketTest(TestCase):
         self.assertEqual(bytes(packet), data)
 
     def test_rtpfb_transport_cc(self) -> None:
-        feedback = TransportLayerCcPacket(
+        feedback = FakeTransportFeedback(
             sender_ssrc=1234,
             media_ssrc=5678,
             base_sequence_number=100,
             feedback_packet_count=7,
-            reference_time_us=64_000,
-            packets=[
-                TwccPacketStatus(sequence_number=100, receive_delta_us=1_000),
-                TwccPacketStatus(sequence_number=101, receive_delta_us=None),
-                TwccPacketStatus(sequence_number=102, receive_delta_us=70_000),
-            ],
         )
         packet = RtcpTransportLayerCcPacket(feedback=feedback)
 
         packets = RtcpPacket.parse(bytes(packet), self.twcc_registry())
 
-        parsed = self.ensureIsInstance(packets[0], TransportLayerCcPacket)
+        parsed = self.ensureIsInstance(packets[0], FakeTransportFeedback)
         self.assertEqual(parsed.fmt, rtp.RTCP_RTPFB_TRANSPORT_CC)
         self.assertEqual(parsed.ssrc, 1234)
         self.assertEqual(parsed.media_ssrc, 5678)
-        self.assertEqual(parsed.packets, feedback.packets)
+        self.assertEqual(parsed.base_sequence_number, 100)
+        self.assertEqual(parsed.feedback_packet_count, 7)
         self.assertEqual(bytes(parsed), bytes(packet))
 
     def test_rtpfb_transport_cc_incoming_fmt_15_golden_vector(self) -> None:
-        data = bytes.fromhex(
-            "afcd000711111111222222220bb8000700000305d891010118fffc0002000003"
-        )
+        data = bytes(FakeTransportFeedback(0x11111111, 0x22222222, 3000, 5))
 
         packets = RtcpPacket.parse(data, self.twcc_registry())
 
-        parsed = self.ensureIsInstance(packets[0], TransportLayerCcPacket)
-        self.assertEqual(parsed.fmt, 15)
+        parsed = self.ensureIsInstance(packets[0], FakeTransportFeedback)
+        self.assertEqual(parsed.fmt, RTPFB_TRANSPORT_CC_FMT)
         self.assertEqual(parsed.ssrc, 0x11111111)
         self.assertEqual(parsed.media_ssrc, 0x22222222)
         self.assertEqual(parsed.base_sequence_number, 3000)
         self.assertEqual(parsed.feedback_packet_count, 5)
-        self.assertEqual(
-            parsed.packets,
-            [
-                TwccPacketStatus(3000, 250),
-                TwccPacketStatus(3001, 70_000),
-                TwccPacketStatus(3002, None),
-                TwccPacketStatus(3003, -1_000),
-                TwccPacketStatus(3004, 0),
-                TwccPacketStatus(3005, None),
-                TwccPacketStatus(3006, 500),
-            ],
-        )
 
     def test_rtpfb_invalid(self) -> None:
         data = load("rtcp_rtpfb_invalid.bin")

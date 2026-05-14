@@ -37,9 +37,14 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from pycc import TRANSPORT_CC_URI, PacedPacketInfo, TransportCc, TransportLayerCcPacket
 from rtc_types import RtpSendDecision
 
+from .fake_congestion import (
+    TRANSPORT_CC_URI,
+    FakePacedPacketInfo,
+    FakeTransportCc,
+    FakeTransportFeedback,
+)
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
 RTP = load("rtp.bin")
@@ -80,7 +85,8 @@ class DummyRtcpReceiveComponent:
 
 
 class DummyRtpSendInterceptor:
-    def __init__(self) -> None:
+    def __init__(self, decision: RtpSendDecision | None = None) -> None:
+        self.decision = decision or RtpSendDecision()
         self.packets: list[RtpPacket] = []
         self.contexts: list[object] = []
 
@@ -88,7 +94,7 @@ class DummyRtpSendInterceptor:
         self.packets.append(packet)
         self.contexts.append(context)
         packet.payload += b"!"
-        return RtpSendDecision()
+        return self.decision
 
 
 class DummyRtpSentObserver:
@@ -390,7 +396,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -448,7 +454,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -497,12 +503,45 @@ class RTCDtlsTransportTest(TestCase):
         )
 
     @asynctest
+    async def test_send_rtp_packet_without_twcc_is_not_paced(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        component = FakeTransportCc()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[component],
+        )
+        extensions_map = HeaderExtensionsMap()
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+        )
+
+        self.assertEqual(len(sent_packets), 1)
+        self.assertEqual(len(session._rtp_queue), 0)
+        self.assertEqual(component.pacer.paced_sizes, [])
+        self.assertIsNone(sent_packets[0].extensions.transport_sequence_number)
+
+    @asynctest
     async def test_send_rtp_packet_limits_retransmission_before_twcc(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         extensions_map = HeaderExtensionsMap()
         extensions_map.configure(
@@ -576,12 +615,49 @@ class RTCDtlsTransportTest(TestCase):
         self.assertEqual(sent_observer.contexts[0].payload_size_bytes, 3)
 
     @asynctest
+    async def test_send_rtp_packet_handler_can_request_pacing(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        send_interceptor = DummyRtpSendInterceptor(
+            decision=RtpSendDecision(pace_packet=True)
+        )
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[
+                DummyRtpComponent(send_interceptor=send_interceptor)
+            ],
+        )
+        extensions_map = HeaderExtensionsMap()
+        sent_packets: list[RtpPacket] = []
+
+        async def mock_send_rtp(data: bytes) -> None:
+            sent_packets.append(RtpPacket.parse(data, extensions_map))
+
+        session._send_rtp = mock_send_rtp  # type: ignore
+
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+
+        await session._send_rtp_packet(
+            packet,
+            extensions_map,
+            is_video=True,
+            payload_size_bytes=len(packet.payload),
+        )
+
+        self.assertEqual(len(sent_packets), 0)
+        self.assertEqual(len(session._rtp_queue), 1)
+        self.assertTrue(await session._send_next_rtp_packet_from_queue())
+        self.assertEqual(sent_packets[0].payload, b"abc!")
+
+    @asynctest
     async def test_send_probe_padding_packet_uses_twcc_and_probe_info(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         sender = DummyRtpSender()
         sender._ssrc = 1234
@@ -594,7 +670,7 @@ class RTCDtlsTransportTest(TestCase):
         session._send_rtp = mock_send_rtp  # type: ignore
         session._congestion_controller.has_probe_pending = Mock(return_value=True)
         session._congestion_controller.pace_rtp_packet = AsyncMock(
-            return_value=PacedPacketInfo(probe_cluster_id=7)
+            return_value=FakePacedPacketInfo(probe_cluster_id=7)
         )
         session._congestion_controller.next_transport_sequence_number = Mock(
             return_value=55
@@ -615,7 +691,7 @@ class RTCDtlsTransportTest(TestCase):
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         receiver = TwccDummyRtpReceiver()
         parameters = RTCRtpReceiveParameters(
@@ -659,19 +735,19 @@ class RTCDtlsTransportTest(TestCase):
         )
         self.assertEqual(len(sent_rtcp), 1)
         feedback = sent_rtcp[0]
-        self.assertIsInstance(feedback, TransportLayerCcPacket)
-        assert isinstance(feedback, TransportLayerCcPacket)
+        self.assertIsInstance(feedback, FakeTransportFeedback)
+        assert isinstance(feedback, FakeTransportFeedback)
         self.assertEqual(feedback.sender_ssrc, 4321)
         self.assertEqual(feedback.media_ssrc, 1234)
         self.assertEqual(feedback.base_sequence_number, 55)
 
     @asynctest
-    async def test_handle_rtp_data_twcc_feedback_reports_missing_packets(self) -> None:
+    async def test_handle_rtp_data_emits_multiple_twcc_feedback_packets(self) -> None:
         transport1, _ = dummy_ice_transport_pair()
         session = RTCDtlsTransport(
             transport1,
             [RTCCertificate.generateCertificate()],
-            congestion_control=[TransportCc()],
+            congestion_control=[FakeTransportCc()],
         )
         receiver = TwccDummyRtpReceiver()
         parameters = RTCRtpReceiveParameters(
@@ -719,13 +795,9 @@ class RTCDtlsTransportTest(TestCase):
 
         self.assertEqual(len(sent_rtcp), 2)
         feedback = sent_rtcp[-1]
-        self.assertIsInstance(feedback, TransportLayerCcPacket)
-        assert isinstance(feedback, TransportLayerCcPacket)
-        self.assertEqual(feedback.base_sequence_number, 56)
-        self.assertEqual(
-            [packet.received for packet in feedback.packets],
-            [False, True],
-        )
+        self.assertIsInstance(feedback, FakeTransportFeedback)
+        assert isinstance(feedback, FakeTransportFeedback)
+        self.assertEqual(feedback.base_sequence_number, 57)
 
     @asynctest
     async def test_handle_rtp_data_invokes_receive_handlers(self) -> None:
