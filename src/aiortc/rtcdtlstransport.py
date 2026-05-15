@@ -17,7 +17,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from OpenSSL import SSL
 from pyee.asyncio import AsyncIOEventEmitter
 from pylibsrtp import Policy, Session
-from pyrtcp import RtcpPacketRegistry
+from pyrtcp import (
+    PSFB_AFB,
+    RTCP_PSFB,
+    FeedbackPacket,
+    ReceiverEstimatedMaximumBitrate,
+    RtcpPacketRegistry,
+)
 from rtc_types import (
     RtcpReceiveContext,
     RtcpReceiveObserver,
@@ -302,6 +308,24 @@ def _serialize_runtime_packet(packet: object) -> bytes:
     if serialize is not None:
         return serialize()
     return bytes(packet)
+
+
+def _normalize_runtime_rtcp_packet(packet: AnyRtcpPacket) -> object:
+    if isinstance(packet, RtcpPsfbPacket):
+        feedback_packet = FeedbackPacket(
+            packet_type=RTCP_PSFB,
+            fmt=packet.fmt,
+            sender_ssrc=packet.ssrc,
+            media_ssrc=packet.media_ssrc,
+            fci=packet.fci,
+        )
+        if packet.fmt == PSFB_AFB and packet.fci[:4] == b"REMB":
+            try:
+                return ReceiverEstimatedMaximumBitrate.parse(feedback_packet)
+            except ValueError:
+                pass
+        return feedback_packet
+    return packet
 
 
 class RtpRouter:
@@ -722,8 +746,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
         context = RtcpReceiveContext(now_us=clock.current_monotonic_us())
         for packet in packets:
+            runtime_packet = _normalize_runtime_rtcp_packet(packet)
             for handler in self._rtcp_receive_handlers:
-                feedback_packets = handler.on_rtcp_received(packet, context)
+                feedback_packets = handler.on_rtcp_received(runtime_packet, context)
                 for feedback_packet in feedback_packets:
                     try:
                         await self._send_rtp(

@@ -37,6 +37,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
+from pyrtcp import ReceiverEstimatedMaximumBitrate
 from rtc_types import RtcRuntimeContributions, RtpSendDecision
 
 from .fake_congestion import (
@@ -65,12 +66,12 @@ class DummyDataReceiver:
 
 
 class DummyRtcpReceiveHandler:
-    def __init__(self, emitted_packets: list[AnyRtcpPacket] | None = None) -> None:
+    def __init__(self, emitted_packets: list[object] | None = None) -> None:
         self.emitted_packets = emitted_packets or []
-        self.packets: list[AnyRtcpPacket] = []
+        self.packets: list[object] = []
         self.now_us: list[int] = []
 
-    def on_rtcp_received(self, packet: AnyRtcpPacket, context: object) -> list[object]:
+    def on_rtcp_received(self, packet: object, context: object) -> list[object]:
         self.packets.append(packet)
         self.now_us.append(getattr(context, "now_us"))
         return self.emitted_packets
@@ -867,6 +868,33 @@ class RTCDtlsTransportTest(TestCase):
         self.assertEqual(len(handler.now_us), 1)
         self.assertGreater(handler.now_us[0], 0)
         self.assertEqual(sent_rtcp, [bytes(emitted_packet)])
+
+    @asynctest
+    async def test_handle_rtcp_data_normalizes_remb_for_receive_handlers(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        handler = DummyRtcpReceiveHandler()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+            congestion_control=[DummyRtcpReceiveComponent(handler)],
+        )
+
+        packet = RtcpPsfbPacket(
+            fmt=RTCP_PSFB_APP,
+            ssrc=1234,
+            media_ssrc=0,
+            fci=pack_remb_fci(4160000, [3456]),
+        )
+        await session._handle_rtcp_data(bytes(packet))
+
+        self.assertEqual(len(handler.packets), 1)
+        feedback = handler.packets[0]
+        self.assertIsInstance(feedback, ReceiverEstimatedMaximumBitrate)
+        assert isinstance(feedback, ReceiverEstimatedMaximumBitrate)
+        self.assertEqual(feedback.sender_ssrc, 1234)
+        self.assertEqual(feedback.media_ssrc, 0)
+        self.assertEqual(feedback.bitrate, 4160000)
+        self.assertEqual(feedback.ssrcs, (3456,))
 
     @asynctest
     async def test_rtp_malformed(self) -> None:
