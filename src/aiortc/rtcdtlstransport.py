@@ -25,21 +25,16 @@ from pyrtcp import (
 )
 from rtc_types import (
     RtcpReceiveContext,
-    RtcpReceiveObserver,
     RtcRuntimeComponent,
     RtcRuntimeContributions,
     RtpPacer,
     RtpReceiveContext,
-    RtpReceiveObserver,
     RtpSendContext,
     RtpSendDecision,
-    RtpSendInterceptor,
     RtpSentContext,
-    RtpSentObserver,
 )
 
 from . import clock, rtp
-from .congestion import TransportCongestionController
 from .rtcicetransport import RTCIceTransport
 from .rtcrtpparameters import RTCRtpReceiveParameters, RTCRtpSendParameters
 from .rtp import (
@@ -53,7 +48,19 @@ from .rtp import (
     RtpPacket,
     is_rtcp,
 )
+from .runtime import (
+    BitrateTargetApplier,
+    EncodedPayloadObserver,
+    RetransmissionLimiter,
+    RoundTripTimeDispatcher,
+    RtcpReceivePipeline,
+    RtpReceivePipeline,
+    RtpSendPipeline,
+    RtpSentPipeline,
+    SenderBitrateAllocator,
+)
 from .stats import RTCStatsReport, RTCTransportStats
+from .transporttrace import NetTraceWriter
 
 CERTIFICATE_T = TypeVar("CERTIFICATE_T", bound="RTCCertificate")
 K = TypeVar("K")
@@ -465,15 +472,29 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
         self._rtp_pacer: Optional[RtpPacer] = None
-        self._congestion_controller = TransportCongestionController()
-        self._rtcp_receive_handlers: list[RtcpReceiveObserver] = []
-        self._rtp_send_interceptors: list[RtpSendInterceptor] = []
-        self._rtp_sent_observers: list[RtpSentObserver] = [
-            self._congestion_controller
-        ]
-        self._rtp_receive_observers: list[RtpReceiveObserver] = []
+        self._trace_writer = NetTraceWriter.from_environment()
+        self._bitrate_allocator = SenderBitrateAllocator(lambda: 7_500_000)
+        self._rtt_dispatcher = RoundTripTimeDispatcher()
+        self._retransmission_limiter = RetransmissionLimiter(
+            lambda: self._bitrate_allocator.session_target_bitrate
+        )
+        self._bitrate_target_applier = BitrateTargetApplier(
+            self._bitrate_allocator,
+            trace_writer=self._trace_writer,
+            retransmission_limiter=self._retransmission_limiter,
+        )
+        self._encoded_payload_observer = EncodedPayloadObserver(
+            self._bitrate_allocator
+        )
+        self._rtcp_receive_pipeline = RtcpReceivePipeline()
+        self._rtp_send_pipeline = RtpSendPipeline()
+        self._rtp_send_pipeline.add(self._retransmission_limiter)
+        self._rtp_sent_pipeline = RtpSentPipeline()
+        self._rtp_sent_pipeline.add(self._retransmission_limiter)
+        self._rtp_sent_pipeline.add(self._encoded_payload_observer)
+        self._rtp_receive_pipeline = RtpReceivePipeline()
         runtime_context = AiortcRuntimeContext(
-            trace_writer=self._congestion_controller.trace_writer
+            trace_writer=self._trace_writer
         )
         for component in tuple(congestion_control or ()):
             self._add_runtime_contributions(
@@ -503,16 +524,16 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
     def _add_runtime_contributions(
         self, contributions: RtcRuntimeContributions
     ) -> None:
-        self._rtcp_receive_handlers.extend(contributions.rtcp_receive_observers)
-        self._rtp_send_interceptors.extend(contributions.rtp_send_interceptors)
-        self._rtp_sent_observers.extend(contributions.rtp_sent_observers)
-        self._rtp_receive_observers.extend(contributions.rtp_receive_observers)
+        self._rtcp_receive_pipeline.extend(contributions.rtcp_receive_observers)
+        self._rtp_send_pipeline.extend(contributions.rtp_send_interceptors)
+        self._rtp_sent_pipeline.extend(contributions.rtp_sent_observers)
+        self._rtp_receive_pipeline.extend(contributions.rtp_receive_observers)
         if contributions.rtp_pacer is not None:
             self._rtp_pacer = contributions.rtp_pacer
         for source in contributions.bitrate_target_sources:
-            source.set_bitrate_target_observer(self._congestion_controller)
+            source.set_bitrate_target_observer(self._bitrate_target_applier)
         for observer in contributions.round_trip_time_observers:
-            self._congestion_controller.add_round_trip_time_observer(observer)
+            self._rtt_dispatcher.add_observer(observer)
 
     @property
     def state(self) -> str:
@@ -745,15 +766,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         context = RtcpReceiveContext(now_us=clock.current_monotonic_us())
         for packet in packets:
             runtime_packet = _normalize_runtime_rtcp_packet(packet)
-            for handler in self._rtcp_receive_handlers:
-                feedback_packets = handler.on_rtcp_received(runtime_packet, context)
-                for feedback_packet in feedback_packets:
-                    try:
-                        await self._send_rtp(
-                            _serialize_runtime_packet(feedback_packet)
-                        )
-                    except ConnectionError:
-                        pass
+            for feedback_packet in self._rtcp_receive_pipeline.handle(
+                runtime_packet,
+                context,
+            ):
+                try:
+                    await self._send_rtp(_serialize_runtime_packet(feedback_packet))
+                except ConnectionError:
+                    pass
             # route RTCP packet
             for recipient in self._rtp_router.route_rtcp(packet):
                 await recipient._handle_rtcp_packet(packet)
@@ -772,15 +792,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 arrival_time_ms=arrival_time_ms,
                 receiver=receiver,
             )
-            for observer in self._rtp_receive_observers:
-                feedback_packets = observer.on_rtp_received(packet, context)
-                for feedback_packet in feedback_packets:
-                    try:
-                        await self._send_rtp(
-                            _serialize_runtime_packet(feedback_packet)
-                        )
-                    except ConnectionError:
-                        pass
+            for feedback_packet in self._rtp_receive_pipeline.handle(packet, context):
+                try:
+                    await self._send_rtp(_serialize_runtime_packet(feedback_packet))
+                except ConnectionError:
+                    pass
             await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
 
     async def _recv_next(self) -> None:
@@ -851,14 +867,13 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             payload_types=[codec.payloadType for codec in parameters.codecs],
             mid=parameters.muxId,
         )
-        self._congestion_controller.register_receiver(receiver)
 
     def _register_rtp_sender(
         self, sender: RtpSender, parameters: RTCRtpSendParameters
     ) -> None:
         self._rtp_header_extensions_map.configure(parameters)
         self._rtp_router.register_sender(sender, ssrc=sender._ssrc)
-        self._congestion_controller.register_sender(sender)
+        self._bitrate_allocator.register_sender(sender)
 
     async def _send_data(self, data: bytes) -> None:
         if self._state != State.CONNECTED:
@@ -889,29 +904,21 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         is_retransmission: bool,
         is_probe: bool = False,
     ) -> RtpSendDecision:
+        packet_size_bytes = len(packet.serialize(extensions_map)) + (
+            8 if is_video else 0
+        )
         context = RtpSendContext(
             now_us=clock.current_monotonic_us(),
             is_video=is_video,
             is_retransmission=is_retransmission,
             is_probe=is_probe,
             payload_size_bytes=payload_size_bytes,
+            packet_size_bytes=packet_size_bytes,
             supports_transport_sequence_number=(
                 extensions_map.has_transport_sequence_number
             ),
         )
-        combined_decision = RtpSendDecision()
-        for interceptor in self._rtp_send_interceptors:
-            decision = interceptor.prepare_rtp(packet, context)
-            if decision.drop_packet:
-                return decision
-            combined_decision = RtpSendDecision(
-                continue_pipeline=decision.continue_pipeline,
-                drop_packet=False,
-                pace_packet=combined_decision.pace_packet or decision.pace_packet,
-            )
-            if not decision.continue_pipeline:
-                break
-        return combined_decision
+        return self._rtp_send_pipeline.prepare(packet, context)
 
     def _notify_rtp_sent(
         self,
@@ -929,8 +936,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             is_retransmission=is_retransmission,
             pacing_info=pacing_info,
         )
-        for observer in self._rtp_sent_observers:
-            observer.on_rtp_sent(packet, context)
+        self._rtp_sent_pipeline.notify(packet, context)
 
     async def _send_rtp_packet(
         self,
@@ -947,14 +953,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             packet.extensions.abs_send_time = (
                 clock.current_ntp_time() >> 14
             ) & 0x00FFFFFF
-            if (
-                is_retransmission
-                and not self._congestion_controller.allow_retransmission(
-                    size_bytes=len(packet.serialize(extensions_map))
-                    + (8 if is_video else 0)
-                )
-            ):
-                return
             send_decision = self._prepare_rtp_packet(
                 packet,
                 extensions_map,
@@ -1148,11 +1146,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     def _unregister_rtp_receiver(self, receiver: RtpReceiver) -> None:
         self._rtp_router.unregister_receiver(receiver)
-        self._congestion_controller.unregister_receiver(receiver)
 
     def _unregister_rtp_sender(self, sender: RtpSender) -> None:
         self._rtp_router.unregister_sender(sender)
-        self._congestion_controller.unregister_sender(sender)
+        self._bitrate_allocator.unregister_sender(sender)
 
     async def _write_ssl(self) -> None:
         """

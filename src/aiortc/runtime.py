@@ -5,12 +5,20 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Optional, Protocol
 
 from rtc_types import (
     BitrateTarget,
     RoundTripTimeObserver,
+    RtcpReceiveContext,
+    RtcpReceiveObserver,
+    RtpReceiveContext,
+    RtpReceiveObserver,
+    RtpSendContext,
+    RtpSendDecision,
+    RtpSendInterceptor,
     RtpSentContext,
+    RtpSentObserver,
 )
 
 from . import clock
@@ -38,7 +46,7 @@ _TARGET_APPLY_MIN_DELTA_BPS = 25_000
 _TARGET_APPLY_MIN_DELTA_RATIO = 0.01
 
 
-class CongestionControlledSender(Protocol):
+class BitrateControlledSender(Protocol):
     _ssrc: int
     kind: str
 
@@ -47,18 +55,12 @@ class CongestionControlledSender(Protocol):
     def _set_target_bitrate(self, bitrate: int) -> None: ...
 
 
-class CongestionControlledReceiver(Protocol):
-    kind: str
-
-    def _get_rtcp_ssrc(self) -> Optional[int]: ...
-
-
 RttHandler = Callable[[int], None]
 
 
 @dataclass
 class SenderState:
-    sender: CongestionControlledSender
+    sender: BitrateControlledSender
     weight: float
     allocated_bitrate: int
     applied_bitrate: Optional[int] = None
@@ -97,7 +99,7 @@ class SenderBitrateAllocator:
     def session_target_bitrate(self) -> int:
         return self.__current_session_target()
 
-    def register_sender(self, sender: CongestionControlledSender) -> None:
+    def register_sender(self, sender: BitrateControlledSender) -> None:
         if sender.kind != "video":
             return
 
@@ -109,7 +111,7 @@ class SenderBitrateAllocator:
         )
         self.recompute_allocation()
 
-    def unregister_sender(self, sender: CongestionControlledSender) -> None:
+    def unregister_sender(self, sender: BitrateControlledSender) -> None:
         self.__senders.pop(sender._ssrc, None)
         self.__estimates.pop(sender._ssrc, None)
         self.recompute_allocation()
@@ -212,19 +214,13 @@ class SenderBitrateAllocator:
         state.applied_bitrate = state.sender._get_target_bitrate() or bitrate
 
     def __clamp_sender_target(
-        self, sender: CongestionControlledSender, bitrate: int
+        self, sender: BitrateControlledSender, bitrate: int
     ) -> int:
         get_bounds = getattr(sender, "_get_bitrate_bounds", None)
         if get_bounds is None:
             return bitrate
         min_bitrate, max_bitrate = get_bounds()
         return max(min_bitrate, min(max_bitrate, bitrate))
-
-
-@dataclass(frozen=True)
-class _NullPacerConfig:
-    send_bitrate_bps: int = 0
-    probe_cluster: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -319,72 +315,183 @@ class _RateLimiter:
             self.__bytes_in_window -= size_bytes
 
 
-class _NullTransportControl:
-    def get_pacer_config(self) -> _NullPacerConfig:
-        return _NullPacerConfig()
-
-    def get_target_bitrate(self) -> int:
-        return 7_500_000
-
-    def update_pacing_queue(
-        self, queue_bytes: int, oldest_queue_age_ms: int = 0
-    ) -> None:
-        pass
-
-    def get_telemetry(self) -> _NullTransportTelemetry:
-        return _NullTransportTelemetry()
-
-
-class TransportCongestionController:
-    """
-    Transport-scoped adapter for congestion-control runtime hardpoints.
-
-    aiortc owns sender/receiver registration, bitrate application, and the
-    final RTP/RTCP write path. Congestion-control components install their
-    policy objects into this adapter through generic runtime hooks.
-    """
-
+class RtcpReceivePipeline:
     def __init__(self) -> None:
-        self.__receivers: set[CongestionControlledReceiver] = set()
-        self.__net_trace_writer = NetTraceWriter.from_environment()
-        self.__transport_control = _NullTransportControl()
-        self.__bitrate_allocator = SenderBitrateAllocator(
-            self.__transport_control.get_target_bitrate
-        )
+        self.__observers: list[RtcpReceiveObserver] = []
+
+    def add(self, observer: RtcpReceiveObserver) -> None:
+        self.__observers.append(observer)
+
+    def extend(self, observers: list[RtcpReceiveObserver]) -> None:
+        self.__observers.extend(observers)
+
+    def handle(self, packet: object, context: RtcpReceiveContext) -> list[object]:
+        feedback_packets = []
+        for observer in self.__observers:
+            feedback_packets.extend(observer.on_rtcp_received(packet, context))
+        return feedback_packets
+
+
+class RtpReceivePipeline:
+    def __init__(self) -> None:
+        self.__observers: list[RtpReceiveObserver] = []
+
+    def add(self, observer: RtpReceiveObserver) -> None:
+        self.__observers.append(observer)
+
+    def extend(self, observers: list[RtpReceiveObserver]) -> None:
+        self.__observers.extend(observers)
+
+    def handle(self, packet: object, context: RtpReceiveContext) -> list[object]:
+        feedback_packets = []
+        for observer in self.__observers:
+            feedback_packets.extend(observer.on_rtp_received(packet, context))
+        return feedback_packets
+
+
+class RtpSendPipeline:
+    def __init__(self) -> None:
+        self.__interceptors: list[RtpSendInterceptor] = []
+
+    @property
+    def interceptors(self) -> list[RtpSendInterceptor]:
+        return self.__interceptors
+
+    def add(self, interceptor: RtpSendInterceptor) -> None:
+        self.__interceptors.append(interceptor)
+
+    def extend(self, interceptors: list[RtpSendInterceptor]) -> None:
+        self.__interceptors.extend(interceptors)
+
+    def prepare(self, packet: object, context: RtpSendContext) -> RtpSendDecision:
+        combined_decision = RtpSendDecision()
+        for interceptor in self.__interceptors:
+            decision = interceptor.prepare_rtp(packet, context)
+            if decision.drop_packet:
+                return decision
+            combined_decision = RtpSendDecision(
+                continue_pipeline=decision.continue_pipeline,
+                drop_packet=False,
+                pace_packet=combined_decision.pace_packet or decision.pace_packet,
+            )
+            if not decision.continue_pipeline:
+                break
+        return combined_decision
+
+
+class RtpSentPipeline:
+    def __init__(self) -> None:
+        self.__observers: list[RtpSentObserver] = []
+
+    def add(self, observer: RtpSentObserver) -> None:
+        self.__observers.append(observer)
+
+    def extend(self, observers: list[RtpSentObserver]) -> None:
+        self.__observers.extend(observers)
+
+    def notify(self, packet: object, context: RtpSentContext) -> None:
+        for observer in self.__observers:
+            observer.on_rtp_sent(packet, context)
+
+
+class RoundTripTimeDispatcher:
+    def __init__(self) -> None:
         self.__rtt_handlers: list[RttHandler] = []
-        self.__transport_feedback_active = False
+
+    def add_observer(self, observer: RoundTripTimeObserver) -> None:
+        self.__rtt_handlers.append(observer.on_round_trip_time)
+
+    def set_rtt(self, rtt_ms: int) -> None:
+        if rtt_ms <= 0:
+            return
+        for handler in self.__rtt_handlers:
+            handler(rtt_ms)
+
+
+class RetransmissionLimiter:
+    def __init__(self, target_bitrate_provider: Callable[[], int]) -> None:
+        self.__target_bitrate_provider = target_bitrate_provider
         self.__retransmission_rate_limiter = _RateLimiter(
             _RETRANSMISSION_RATE_LIMIT_WINDOW_MS
         )
         self.__retransmission_sent_bytes = 0
         self.__retransmission_limited_bytes = 0
         self.__retransmission_limited_packets = 0
+
+    @property
+    def retransmission_sent_bytes(self) -> int:
+        return self.__retransmission_sent_bytes
+
+    @property
+    def retransmission_limited_bytes(self) -> int:
+        return self.__retransmission_limited_bytes
+
+    @property
+    def retransmission_limited_packets(self) -> int:
+        return self.__retransmission_limited_packets
+
+    def prepare_rtp(self, packet: object, context: RtpSendContext) -> RtpSendDecision:
+        if not context.is_retransmission:
+            return RtpSendDecision()
+
+        if self.allow_retransmission(
+            size_bytes=context.packet_size_bytes,
+            now_ms=context.now_ms,
+        ):
+            return RtpSendDecision()
+
+        return RtpSendDecision(drop_packet=True)
+
+    def allow_retransmission(
+        self, *, size_bytes: int, now_ms: Optional[int] = None
+    ) -> bool:
+        now_ms = (
+            clock.current_monotonic_us() // 1000
+            if now_ms is None
+            else now_ms
+        )
+        self.__retransmission_rate_limiter.set_max_rate(
+            self.__target_bitrate_provider()
+        )
+        if self.__retransmission_rate_limiter.try_use(size_bytes, now_ms):
+            return True
+
+        self.__retransmission_limited_packets += 1
+        self.__retransmission_limited_bytes += max(0, size_bytes)
+        return False
+
+    def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
+        if context.is_retransmission:
+            self.__retransmission_sent_bytes += max(0, context.size_bytes)
+
+
+class EncodedPayloadObserver:
+    def __init__(self, bitrate_allocator: SenderBitrateAllocator) -> None:
+        self.__bitrate_allocator = bitrate_allocator
+
+    def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
+        self.__bitrate_allocator.observe_encoded_frame(
+            ssrc=packet.ssrc,
+            payload_bytes=context.payload_size_bytes,
+        )
+
+
+class BitrateTargetApplier:
+    def __init__(
+        self,
+        bitrate_allocator: SenderBitrateAllocator,
+        *,
+        trace_writer: NetTraceWriter | None,
+        retransmission_limiter: RetransmissionLimiter,
+    ) -> None:
+        self.__bitrate_allocator = bitrate_allocator
+        self.__net_trace_writer = trace_writer
+        self.__retransmission_limiter = retransmission_limiter
+        self.__transport_feedback_active = False
         self.__last_telemetry_ms: Optional[int] = None
         self.__last_telemetry_snapshot: Optional[TelemetrySnapshot] = None
         self.__last_logged_target_bitrate: Optional[int] = None
         self.__last_logged_delay_usage: Optional[str] = None
-
-    @property
-    def trace_writer(self) -> NetTraceWriter | None:
-        return self.__net_trace_writer
-
-    def add_round_trip_time_observer(
-        self, observer: RoundTripTimeObserver
-    ) -> None:
-        self.__rtt_handlers.append(observer.on_round_trip_time)
-
-    def register_receiver(self, receiver: CongestionControlledReceiver) -> None:
-        if getattr(receiver, "kind", None) == "video":
-            self.__receivers.add(receiver)
-
-    def unregister_receiver(self, receiver: CongestionControlledReceiver) -> None:
-        self.__receivers.discard(receiver)
-
-    def register_sender(self, sender: CongestionControlledSender) -> None:
-        self.__bitrate_allocator.register_sender(sender)
-
-    def unregister_sender(self, sender: CongestionControlledSender) -> None:
-        self.__bitrate_allocator.unregister_sender(sender)
 
     def update_receiver_estimate(
         self, bitrate: int, ssrcs: list[int], now_ms: int
@@ -463,64 +570,9 @@ class TransportCongestionController:
             pacer_bitrate_bps=target.pacer_bitrate_bps,
         )
 
-    def set_rtt(self, rtt_ms: int) -> None:
-        if rtt_ms <= 0:
-            return
-        for handler in self.__rtt_handlers:
-            handler(rtt_ms)
-
-    def allow_retransmission(
-        self, *, size_bytes: int, now_ms: Optional[int] = None
-    ) -> bool:
-        now_ms = (
-            clock.current_monotonic_us() // 1000
-            if now_ms is None
-            else now_ms
-        )
-        target_bitrate = self.__bitrate_allocator.session_target_bitrate
-        self.__retransmission_rate_limiter.set_max_rate(target_bitrate)
-        if self.__retransmission_rate_limiter.try_use(size_bytes, now_ms):
-            return True
-
-        self.__retransmission_limited_packets += 1
-        self.__retransmission_limited_bytes += max(0, size_bytes)
-        return False
-
-    def on_packet_sent(
-        self,
-        *,
-        send_time_us: int,
-        size_bytes: int,
-        payload_size_bytes: int = 0,
-        ssrc: int,
-        rtp_sequence_number: int,
-        is_retransmission: bool = False,
-        pacing_info: Any | None = None,
-    ) -> None:
-        if is_retransmission:
-            self.__retransmission_sent_bytes += max(0, size_bytes)
-        self.observe_encoded_frame(ssrc=ssrc, payload_bytes=payload_size_bytes)
-
-    def observe_encoded_frame(self, *, ssrc: int, payload_bytes: int) -> None:
-        self.__bitrate_allocator.observe_encoded_frame(
-            ssrc=ssrc,
-            payload_bytes=payload_bytes,
-        )
-
-    def on_rtp_sent(self, packet: object, context: RtpSentContext) -> None:
-        self.on_packet_sent(
-            send_time_us=context.send_time_us,
-            size_bytes=context.size_bytes,
-            payload_size_bytes=context.payload_size_bytes,
-            ssrc=packet.ssrc,
-            rtp_sequence_number=packet.sequence_number,
-            is_retransmission=context.is_retransmission,
-            pacing_info=context.pacing_info,
-        )
-
     def __log_target_update(self, previous_target, update, telemetry=None) -> None:
         if telemetry is None:
-            telemetry = self.__transport_control.get_telemetry()
+            telemetry = _NullTransportTelemetry()
         previous = (
             previous_target
             if previous_target is not None
@@ -641,13 +693,13 @@ class TransportCongestionController:
             telemetry=(
                 telemetry
                 if telemetry is not None
-                else self.__transport_control.get_telemetry()
+                else _NullTransportTelemetry()
             ),
         )
 
     def __log_delay_usage_transition(self, telemetry=None) -> None:
         if telemetry is None:
-            telemetry = self.__transport_control.get_telemetry()
+            telemetry = _NullTransportTelemetry()
         usage = telemetry.delay_usage
         previous = self.__last_logged_delay_usage
         if usage == previous:
@@ -697,15 +749,14 @@ class TransportCongestionController:
         self.__last_telemetry_ms = now_ms
 
         if telemetry is None:
-            telemetry = self.__transport_control.get_telemetry()
+            telemetry = _NullTransportTelemetry()
         if telemetry.feedback_count <= 0:
             return
 
-        pacer = self.__transport_control.get_pacer_config()
         pacer_bitrate = (
             pacer_bitrate_bps
             if pacer_bitrate_bps is not None
-            else pacer.send_bitrate_bps
+            else 0
         )
         states = self.__bitrate_allocator.states
         allocated_total = sum(state.allocated_bitrate for state in states)
@@ -757,7 +808,7 @@ class TransportCongestionController:
             )
             retransmission_sent_rate_bps = int(
                 (
-                    self.__retransmission_sent_bytes
+                    self.__retransmission_limiter.retransmission_sent_bytes
                     - self.__last_telemetry_snapshot.retransmission_sent_bytes
                 )
                 * 8
@@ -765,14 +816,14 @@ class TransportCongestionController:
             )
             retransmission_limited_rate_bps = int(
                 (
-                    self.__retransmission_limited_bytes
+                    self.__retransmission_limiter.retransmission_limited_bytes
                     - self.__last_telemetry_snapshot.retransmission_limited_bytes
                 )
                 * 8
                 / elapsed_s
             )
             retransmission_limited_packets = (
-                self.__retransmission_limited_packets
+                self.__retransmission_limiter.retransmission_limited_packets
                 - self.__last_telemetry_snapshot.retransmission_limited_packets
             )
             encoded_rate_bps_by_ssrc = {}
@@ -797,9 +848,15 @@ class TransportCongestionController:
             acknowledged_bytes=telemetry.acknowledged_bytes,
             lost_bytes=telemetry.lost_bytes,
             prior_unacked_bytes=telemetry.prior_unacked_bytes,
-            retransmission_sent_bytes=self.__retransmission_sent_bytes,
-            retransmission_limited_bytes=self.__retransmission_limited_bytes,
-            retransmission_limited_packets=self.__retransmission_limited_packets,
+            retransmission_sent_bytes=(
+                self.__retransmission_limiter.retransmission_sent_bytes
+            ),
+            retransmission_limited_bytes=(
+                self.__retransmission_limiter.retransmission_limited_bytes
+            ),
+            retransmission_limited_packets=(
+                self.__retransmission_limiter.retransmission_limited_packets
+            ),
             encoded_payload_bytes_by_ssrc={
                 state.sender._ssrc: state.encoded_payload_bytes for state in states
             },

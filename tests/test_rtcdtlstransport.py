@@ -44,6 +44,7 @@ from .fake_congestion import (
     TRANSPORT_CC_URI,
     FakeRtpPacer,
     FakeTransportCc,
+    FakeTransportRtpSendInterceptor,
 )
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -553,10 +554,15 @@ class RTCDtlsTransportTest(TestCase):
                 ]
             )
         )
-        session._congestion_controller.allow_retransmission = Mock(
+        session._retransmission_limiter.allow_retransmission = Mock(
             return_value=False
         )
-        session._congestion_controller.next_transport_sequence_number = Mock()
+        component = next(
+            interceptor
+            for interceptor in session._rtp_send_pipeline.interceptors
+            if isinstance(interceptor, FakeTransportRtpSendInterceptor)
+        )
+        component.controller.next_transport_sequence_number = Mock()
 
         packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
         packet.ssrc = 1234
@@ -572,7 +578,7 @@ class RTCDtlsTransportTest(TestCase):
 
         self.assertIsNone(packet.extensions.transport_sequence_number)
         self.assertEqual(len(session._rtp_queue), 0)
-        session._congestion_controller.next_transport_sequence_number.assert_not_called()
+        component.controller.next_transport_sequence_number.assert_not_called()
 
     @asynctest
     async def test_send_rtp_packet_invokes_send_handlers(self) -> None:

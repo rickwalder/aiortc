@@ -7,10 +7,14 @@ from aiortc.codecs import (
     get_header_extension_parameters,
     is_rtx,
 )
-from aiortc.congestion import TransportCongestionController
 from aiortc.rtccomponents import get_congestion_control_capabilities
 from aiortc.rtcpeerconnection import RTCPeerConnection
 from aiortc.rtcrtpparameters import RTCRtcpFeedback
+from aiortc.runtime import (
+    BitrateTargetApplier,
+    RetransmissionLimiter,
+    SenderBitrateAllocator,
+)
 from rtc_types import (
     RtcCapabilities,
     RtcpFeedbackCapability,
@@ -176,18 +180,28 @@ class TransportControlCapabilitiesTest(TestCase):
                 self.assertIn(transport_cc_feedback, codec.rtcpFeedback)
 
 
-class TransportCongestionControllerTest(TestCase):
-    def make_controller(self, *components: object) -> TransportCongestionController:
-        controller = TransportCongestionController()
-        install_fake_congestion_components(controller, *components)
-        return controller
+class BitrateTargetApplierTest(TestCase):
+    def make_runtime(
+        self, *components: object
+    ) -> tuple[SenderBitrateAllocator, BitrateTargetApplier, RetransmissionLimiter]:
+        allocator = SenderBitrateAllocator(lambda: 7_500_000)
+        retransmission_limiter = RetransmissionLimiter(
+            lambda: allocator.session_target_bitrate
+        )
+        applier = BitrateTargetApplier(
+            allocator,
+            trace_writer=None,
+            retransmission_limiter=retransmission_limiter,
+        )
+        install_fake_congestion_components(applier, *components)
+        return allocator, applier, retransmission_limiter
 
     def test_receiver_estimate_updates_sender_allocation(self) -> None:
-        controller = TransportCongestionController()
+        allocator, applier, _ = self.make_runtime()
         sender = DummySender(ssrc=1234)
-        controller.register_sender(sender)
+        allocator.register_sender(sender)
 
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=1_000_000,
             ssrcs=[1234],
             now_ms=100,
@@ -196,21 +210,21 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.target_bitrate, 1_000_000)
 
     def test_small_receiver_estimate_changes_do_not_reconfigure_sender(self) -> None:
-        controller = self.make_controller(FakeTransportCc())
+        allocator, applier, _ = self.make_runtime(FakeTransportCc())
         sender = DummySender(ssrc=1234)
-        controller.register_sender(sender)
+        allocator.register_sender(sender)
 
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=3_000_000,
             ssrcs=[1234],
             now_ms=100,
         )
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=3_010_000,
             ssrcs=[1234],
             now_ms=300,
         )
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=3_040_000,
             ssrcs=[1234],
             now_ms=500,
@@ -219,16 +233,16 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.applied_bitrates[-2:], [3_000_000, 3_040_000])
 
     def test_sender_target_application_respects_sender_bounds(self) -> None:
-        controller = self.make_controller(FakeTransportCc())
+        allocator, applier, _ = self.make_runtime(FakeTransportCc())
         sender = DummyBoundedSender(ssrc=1234)
-        controller.register_sender(sender)
+        allocator.register_sender(sender)
 
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=14_000_000,
             ssrcs=[1234],
             now_ms=100,
         )
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=14_100_000,
             ssrcs=[1234],
             now_ms=300,
@@ -238,13 +252,13 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.applied_bitrates, [3_000_000])
 
     def test_sender_target_application_snaps_to_bound_within_hysteresis(self) -> None:
-        controller = self.make_controller(FakeTransportCc())
+        allocator, applier, _ = self.make_runtime(FakeTransportCc())
         sender = DummyBoundedSender(ssrc=1234, target_bitrate=2_980_000)
-        controller.register_sender(sender)
+        allocator.register_sender(sender)
         sender.target_bitrate = 2_980_000
         sender.applied_bitrates.clear()
 
-        controller.update_receiver_estimate(
+        applier.update_receiver_estimate(
             bitrate=3_010_000,
             ssrcs=[1234],
             now_ms=100,
@@ -254,24 +268,33 @@ class TransportCongestionControllerTest(TestCase):
         self.assertEqual(sender.applied_bitrates, [3_000_000])
 
     def test_retransmission_rate_limiter_uses_transport_target_window(self) -> None:
-        controller = self.make_controller(FakeTransportCc())
+        _, _, retransmission_limiter = self.make_runtime(FakeTransportCc())
 
         self.assertTrue(
-            controller.allow_retransmission(size_bytes=450_000, now_ms=0)
+            retransmission_limiter.allow_retransmission(
+                size_bytes=450_000,
+                now_ms=0,
+            )
         )
         self.assertFalse(
-            controller.allow_retransmission(size_bytes=20_000, now_ms=0)
+            retransmission_limiter.allow_retransmission(
+                size_bytes=20_000,
+                now_ms=0,
+            )
         )
         self.assertTrue(
-            controller.allow_retransmission(size_bytes=20_000, now_ms=501)
+            retransmission_limiter.allow_retransmission(
+                size_bytes=20_000,
+                now_ms=501,
+            )
         )
 
     def test_initial_allocation_splits_transport_target_evenly(self) -> None:
-        controller = self.make_controller(FakeTransportCc())
+        allocator, _, _ = self.make_runtime(FakeTransportCc())
         senders = [DummySender(1000 + i) for i in range(3)]
 
         for sender in senders:
-            controller.register_sender(sender)
+            allocator.register_sender(sender)
 
         self.assertEqual(
             [sender.target_bitrate for sender in senders],

@@ -322,7 +322,7 @@ class RTCRtpSenderTest(TestCase):
             component = FakeTransportCc()
             local_transport._add_runtime_contributions(
                 component.runtime_contributions(
-                    FakeRuntimeContext(local_transport._congestion_controller)
+                    FakeRuntimeContext(local_transport)
                 )
             )
             component.pacer.pace = AsyncMock(wraps=component.pacer.pace)

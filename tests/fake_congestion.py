@@ -33,8 +33,10 @@ def install_fake_congestion_components(controller: object, *components: object) 
         contributions = component.runtime_contributions(context)
         for source in contributions.bitrate_target_sources:
             source.set_bitrate_target_observer(controller)
-        for observer in contributions.round_trip_time_observers:
-            controller.add_round_trip_time_observer(observer)
+        add_rtt_observer = getattr(controller, "add_round_trip_time_observer", None)
+        if add_rtt_observer is not None:
+            for observer in contributions.round_trip_time_observers:
+                add_rtt_observer(observer)
 
 
 class FakeRuntimeContext:
