@@ -22,7 +22,6 @@ from pyrtcp import (
     RTCP_PSFB,
     FeedbackPacket,
     ReceiverEstimatedMaximumBitrate,
-    RtcpPacketRegistry,
 )
 from rtc_types import (
     RtcpReceiveContext,
@@ -380,6 +379,8 @@ class RtpRouter:
         if isinstance(packet, (RtcpRrPacket, RtcpSrPacket)):
             for report in packet.reports:
                 add_recipient(self.senders.get(report.ssrc))
+        elif isinstance(packet, FeedbackPacket):
+            add_recipient(self.senders.get(packet.media_ssrc))
         elif isinstance(packet, (RtcpPsfbPacket, RtcpRtpfbPacket)):
             add_recipient(self.senders.get(packet.media_ssrc))
 
@@ -464,7 +465,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._rtp_queue_bytes = 0
         self._rtp_queue_event = asyncio.Event()
         self._rtp_pacer: Optional[RtpPacer] = None
-        self._rtcp_packet_registry = RtcpPacketRegistry()
         self._congestion_controller = TransportCongestionController()
         self._rtcp_receive_handlers: list[RtcpReceiveObserver] = []
         self._rtp_send_interceptors: list[RtpSendInterceptor] = []
@@ -503,8 +503,6 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
     def _add_runtime_contributions(
         self, contributions: RtcRuntimeContributions
     ) -> None:
-        for codec in contributions.rtcp_codecs:
-            self._rtcp_packet_registry.register(codec)
         self._rtcp_receive_handlers.extend(contributions.rtcp_receive_observers)
         self._rtp_send_interceptors.extend(contributions.rtp_send_interceptors)
         self._rtp_sent_observers.extend(contributions.rtp_sent_observers)
@@ -739,7 +737,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     async def _handle_rtcp_data(self, data: bytes) -> None:
         try:
-            packets = RtcpPacket.parse(data, self._rtcp_packet_registry)
+            packets = RtcpPacket.parse(data)
         except ValueError as exc:
             self.__log_debug("x RTCP parsing failed: %s", exc)
             return

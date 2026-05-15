@@ -37,14 +37,13 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from OpenSSL import SSL
-from pyrtcp import ReceiverEstimatedMaximumBitrate
+from pyrtcp import FeedbackPacket, ReceiverEstimatedMaximumBitrate
 from rtc_types import RtcRuntimeContributions, RtpSendDecision
 
 from .fake_congestion import (
     TRANSPORT_CC_URI,
     FakeRtpPacer,
     FakeTransportCc,
-    FakeTransportFeedback,
 )
 from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
 
@@ -711,7 +710,7 @@ class RTCDtlsTransportTest(TestCase):
         sent_rtcp: list[AnyRtcpPacket] = []
 
         async def mock_send_rtp(data: bytes) -> None:
-            sent_rtcp.extend(RtcpPacket.parse(data, session._rtcp_packet_registry))
+            sent_rtcp.extend(RtcpPacket.parse(data))
 
         session._send_rtp = mock_send_rtp  # type: ignore
 
@@ -733,11 +732,11 @@ class RTCDtlsTransportTest(TestCase):
         )
         self.assertEqual(len(sent_rtcp), 1)
         feedback = sent_rtcp[0]
-        self.assertIsInstance(feedback, FakeTransportFeedback)
-        assert isinstance(feedback, FakeTransportFeedback)
+        self.assertIsInstance(feedback, FeedbackPacket)
+        assert isinstance(feedback, FeedbackPacket)
         self.assertEqual(feedback.sender_ssrc, 4321)
         self.assertEqual(feedback.media_ssrc, 1234)
-        self.assertEqual(feedback.base_sequence_number, 55)
+        self.assertEqual(int.from_bytes(feedback.fci[:2], "big"), 55)
 
     @asynctest
     async def test_handle_rtp_data_emits_multiple_twcc_feedback_packets(self) -> None:
@@ -767,7 +766,7 @@ class RTCDtlsTransportTest(TestCase):
         sent_rtcp: list[AnyRtcpPacket] = []
 
         async def mock_send_rtp(data: bytes) -> None:
-            sent_rtcp.extend(RtcpPacket.parse(data, session._rtcp_packet_registry))
+            sent_rtcp.extend(RtcpPacket.parse(data))
 
         session._send_rtp = mock_send_rtp  # type: ignore
 
@@ -793,9 +792,9 @@ class RTCDtlsTransportTest(TestCase):
 
         self.assertEqual(len(sent_rtcp), 2)
         feedback = sent_rtcp[-1]
-        self.assertIsInstance(feedback, FakeTransportFeedback)
-        assert isinstance(feedback, FakeTransportFeedback)
-        self.assertEqual(feedback.base_sequence_number, 57)
+        self.assertIsInstance(feedback, FeedbackPacket)
+        assert isinstance(feedback, FeedbackPacket)
+        self.assertEqual(int.from_bytes(feedback.fci[:2], "big"), 57)
 
     @asynctest
     async def test_handle_rtp_data_invokes_receive_handlers(self) -> None:

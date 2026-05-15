@@ -6,6 +6,7 @@ from typing import Any, Optional, Union
 
 from av import AudioFrame
 from pyrtcp import (
+    FeedbackPacket,
     Goodbye,
     ReceiverReport,
     ReceptionReportBlock,
@@ -640,6 +641,7 @@ AnyRtcpPacket = Union[
     RtcpRrPacket,
     RtcpRtpfbPacket,
     RtcpTransportLayerCcPacket,
+    FeedbackPacket,
     RtcpSdesPacket,
     RtcpSrPacket,
 ]
@@ -708,8 +710,20 @@ class RtcpPacket:
                 packets.append(RtcpSrPacket.parse(payload, count))
             elif packet_type == RTCP_RR:
                 packets.append(RtcpRrPacket.parse(payload, count))
-            elif packet_type == RTCP_RTPFB:
+            elif packet_type == RTCP_RTPFB and count == RTCP_RTPFB_NACK:
                 packets.append(RtcpRtpfbPacket.parse(payload, count))
+            elif packet_type == RTCP_RTPFB:
+                packets.append(
+                    FeedbackPacket.parse(
+                        header=RtcpHeader(
+                            count=count,
+                            packet_type=packet_type,
+                            length=length,
+                            padding=False,
+                        ),
+                        payload=payload,
+                    )
+                )
             elif packet_type == RTCP_PSFB:
                 packets.append(RtcpPsfbPacket.parse(payload, count))
 

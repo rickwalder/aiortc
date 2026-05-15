@@ -40,7 +40,6 @@ def install_fake_congestion_components(controller: object, *components: object) 
 class FakeRuntimeContext:
     def __init__(self, controller: object) -> None:
         self.controller = controller
-        self.rtcp_codecs: list[object] = []
 
     @property
     def trace_writer(self) -> object | None:
@@ -424,6 +423,19 @@ class FakeTransportRtcpReceiveObserver:
         feedback = getattr(packet, "feedback", packet)
         if getattr(feedback, "fmt", None) != RTPFB_TRANSPORT_CC_FMT:
             return []
+        if not isinstance(feedback, FakeTransportFeedback):
+            sender_ssrc = getattr(feedback, "sender_ssrc", getattr(feedback, "ssrc", 0))
+            media_ssrc = getattr(feedback, "media_ssrc", 0)
+            fci = getattr(feedback, "fci", b"")
+            if len(fci) < 4:
+                return []
+            base_sequence_number, feedback_packet_count = unpack("!HH", fci[:4])
+            feedback = FakeTransportFeedback(
+                sender_ssrc=sender_ssrc,
+                media_ssrc=media_ssrc,
+                base_sequence_number=base_sequence_number,
+                feedback_packet_count=feedback_packet_count,
+            )
         update = self.controller.handle_transport_feedback(feedback, context.now_us)
         if self.observer is not None:
             self.observer.on_bitrate_target(
@@ -549,7 +561,6 @@ class FakeTransportCc:
                 FakeTransportRtpReceiveObserver(self.controller)
             ],
             rtp_pacer=self.pacer,
-            rtcp_codecs=[FakeTwccRtcpCodec()],
             bitrate_target_sources=[rtcp_observer],
             round_trip_time_observers=[
                 FakeTransportRoundTripTimeObserver(self.controller)
