@@ -148,12 +148,17 @@ class DummyRtpComponent:
 
 
 class DummyRtpReceiver:
+    kind = "video"
+
     def __init__(self) -> None:
         self.rtp_packets: list[RtpPacket] = []
         self.rtcp_packets: list[AnyRtcpPacket] = []
 
     def _handle_disconnect(self) -> None:
         pass
+
+    def _get_rtcp_ssrc(self) -> int:
+        return 1234
 
     async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
         self.rtp_packets.append(packet)

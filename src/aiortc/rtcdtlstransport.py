@@ -790,7 +790,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         if receiver is not None:
             context = RtpReceiveContext(
                 arrival_time_ms=arrival_time_ms,
-                receiver=receiver,
+                kind=receiver.kind,
+                feedback_ssrc=receiver._get_rtcp_ssrc(),
             )
             for feedback_packet in self._rtp_receive_pipeline.handle(packet, context):
                 try:

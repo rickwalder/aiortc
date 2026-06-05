@@ -206,13 +206,17 @@ class FakeRembReceiver:
     def observe_incoming_rtp(
         self,
         *,
-        receiver: object,
+        kind: str,
         packet: object,
         arrival_time_ms: int,
         feedback_ssrc: int | None,
     ) -> list[FakeRembFeedback]:
         self.observed.append((packet.ssrc, arrival_time_ms))
-        if feedback_ssrc is None or packet.extensions.abs_send_time is None:
+        if (
+            kind != "video"
+            or feedback_ssrc is None
+            or packet.extensions.abs_send_time is None
+        ):
             return []
         return [
             FakeRembFeedback(
@@ -230,7 +234,6 @@ class FakeRembRtpReceiveObserver:
     def on_rtp_received(
         self, packet: object, context: RtpReceiveContext
     ) -> list[object]:
-        feedback_ssrc = context.receiver._get_rtcp_ssrc()
         return [
             RtcpPsfbPacket(
                 fmt=RTCP_PSFB_APP,
@@ -239,10 +242,10 @@ class FakeRembRtpReceiveObserver:
                 fci=pack_remb_fci(feedback.bitrate, feedback.ssrcs),
             )
             for feedback in self.receiver.observe_incoming_rtp(
-                receiver=context.receiver,
+                kind=context.kind,
                 packet=packet,
                 arrival_time_ms=context.arrival_time_ms,
-                feedback_ssrc=feedback_ssrc,
+                feedback_ssrc=context.feedback_ssrc,
             )
         ]
 
@@ -396,9 +399,8 @@ class FakeTransportRtpReceiveObserver:
     def on_rtp_received(
         self, packet: object, context: RtpReceiveContext
     ) -> list[object]:
-        feedback_ssrc = context.receiver._get_rtcp_ssrc()
         transport_sequence_number = packet.extensions.transport_sequence_number
-        if feedback_ssrc is None or transport_sequence_number is None:
+        if context.feedback_ssrc is None or transport_sequence_number is None:
             return []
         return [
             RtcpTransportLayerCcPacket(feedback=feedback)
@@ -406,7 +408,7 @@ class FakeTransportRtpReceiveObserver:
                 media_ssrc=packet.ssrc,
                 transport_sequence_number=transport_sequence_number,
                 arrival_time_us=context.arrival_time_us,
-                feedback_ssrc=feedback_ssrc,
+                feedback_ssrc=context.feedback_ssrc,
             )
         ]
 
