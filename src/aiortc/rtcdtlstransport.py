@@ -28,6 +28,7 @@ from rtc_types import (
     RtcRuntimeComponent,
     RtcRuntimeContributions,
     RtpPacer,
+    RtpPacingInfo,
     RtpReceiveContext,
     RtpSendContext,
     RtpSendDecision,
@@ -928,7 +929,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         size_bytes: int,
         payload_size_bytes: int,
         is_retransmission: bool,
-        pacing_info: object | None = None,
+        pacing_info: RtpPacingInfo | None = None,
     ) -> None:
         context = RtpSentContext(
             send_time_us=clock.current_monotonic_us(),
