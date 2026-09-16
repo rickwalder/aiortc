@@ -11,6 +11,7 @@ from aiortc.rtcdtlstransport import (
     RTCDtlsParameters,
     RTCDtlsTransport,
     RtpRouter,
+    State,
 )
 from aiortc.rtcrtpparameters import (
     RTCRtpCodecParameters,
@@ -373,6 +374,7 @@ class RTCDtlsTransportTest(TestCase):
             sent_packets.append(RtpPacket.parse(data, extensions_map))
 
         session._send_rtp = mock_send_rtp  # type: ignore
+        session._state = State.CONNECTED
         session._congestion_controller.next_transport_sequence_number = Mock()
         session._congestion_controller.pace_rtp_packet = AsyncMock()
         session._congestion_controller.on_packet_sent = Mock()
@@ -382,15 +384,18 @@ class RTCDtlsTransportTest(TestCase):
         packet.ssrc = 1234
         packet.payload = b"abc"
 
-        await session._send_rtp_packet(
-            packet,
-            extensions_map,
-            is_video=True,
-            payload_size_bytes=len(packet.payload),
-        )
+        with patch("aiortc.rtcdtlstransport._clone_rtp_packet") as clone_packet:
+            await session._send_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=True,
+                payload_size_bytes=len(packet.payload),
+            )
 
         self.assertEqual(len(sent_packets), 1)
         self.assertEqual(len(session._rtp_queue), 0)
+        self.assertIsNone(session._rtp_pacer_task)
+        clone_packet.assert_not_called()
         session._congestion_controller.next_transport_sequence_number.assert_not_called()
         session._congestion_controller.pace_rtp_packet.assert_not_called()
         session._congestion_controller.on_packet_sent.assert_not_called()
@@ -423,6 +428,7 @@ class RTCDtlsTransportTest(TestCase):
             sent_packets.append(RtpPacket.parse(data, extensions_map))
 
         session._send_rtp = mock_send_rtp  # type: ignore
+        session._ensure_rtp_pacer_started = Mock()
 
         packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
         packet.ssrc = 1234
@@ -444,6 +450,7 @@ class RTCDtlsTransportTest(TestCase):
         )
 
         self.assertIsNone(packet.extensions.transport_sequence_number)
+        self.assertEqual(session._ensure_rtp_pacer_started.call_count, 2)
         self.assertTrue(await session._send_next_rtp_packet_from_queue())
         self.assertTrue(await session._send_next_rtp_packet_from_queue())
 
@@ -451,6 +458,50 @@ class RTCDtlsTransportTest(TestCase):
             [packet.extensions.transport_sequence_number for packet in sent_packets],
             [0, 1],
         )
+
+    @asynctest
+    async def test_twcc_packet_starts_pacer_lazily(self) -> None:
+        transport1, _ = dummy_ice_transport_pair()
+        session = RTCDtlsTransport(
+            transport1,
+            [RTCCertificate.generateCertificate()],
+        )
+        extensions_map = HeaderExtensionsMap()
+        extensions_map.configure(
+            RTCRtpSendParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(
+                        id=5,
+                        uri=TRANSPORT_CC_URI,
+                    )
+                ]
+            )
+        )
+        packet = RtpPacket(payload_type=100, sequence_number=1000, timestamp=1)
+        packet.ssrc = 1234
+        packet.payload = b"abc"
+        session._state = State.CONNECTED
+
+        with patch("aiortc.rtcdtlstransport.asyncio.ensure_future") as ensure_future:
+            pacer_task = Mock()
+            ensure_future.return_value = pacer_task
+
+            await session._send_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=True,
+                payload_size_bytes=len(packet.payload),
+            )
+            await session._send_rtp_packet(
+                packet,
+                extensions_map,
+                is_video=True,
+                payload_size_bytes=len(packet.payload),
+            )
+
+        self.assertIs(session._rtp_pacer_task, pacer_task)
+        ensure_future.assert_called_once()
+        ensure_future.call_args.args[0].close()
 
     @asynctest
     async def test_send_rtp_packet_limits_retransmission_before_twcc(self) -> None:
