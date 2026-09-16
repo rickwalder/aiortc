@@ -592,7 +592,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self.__log_debug("- DTLS handshake complete")
         self._set_state(State.CONNECTED)
         self._task = asyncio.ensure_future(self.__run())
-        self._rtp_pacer_task = asyncio.ensure_future(self.__run_rtp_pacer())
+        if self._rtp_queue:
+            self._ensure_rtp_pacer_started()
 
     async def stop(self) -> None:
         """
@@ -799,9 +800,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         payload_size_bytes: int = 0,
         is_retransmission: bool = False,
     ) -> None:
-        packet = _clone_rtp_packet(packet)
-
         if is_video and extensions_map.has_transport_sequence_number:
+            packet = _clone_rtp_packet(packet)
             await self._enqueue_rtp_packet(
                 packet,
                 extensions_map,
@@ -877,6 +877,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             self._rtp_queue_bytes += queued.size_bytes
             self._update_rtp_queue_state()
             self._rtp_queue_event.set()
+            self._ensure_rtp_pacer_started()
 
     async def _send_next_rtp_packet_from_queue(self) -> bool:
         if not self._rtp_queue:
@@ -936,6 +937,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     def _set_role(self, role: str) -> None:
         self._role = role
+
+    def _ensure_rtp_pacer_started(self) -> None:
+        if self._rtp_pacer_task is None and self._state == State.CONNECTED:
+            self._rtp_pacer_task = asyncio.ensure_future(self.__run_rtp_pacer())
 
     async def __run_rtp_pacer(self) -> None:
         try:
