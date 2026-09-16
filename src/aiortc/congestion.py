@@ -42,6 +42,8 @@ def _get_telemetry_interval_ms() -> int:
 _TELEMETRY_INTERVAL_MS = _get_telemetry_interval_ms()
 _SIGNIFICANT_TARGET_DROP_RATIO = 0.25
 _RETRANSMISSION_RATE_LIMIT_WINDOW_MS = 500
+RTX_RATE_LIMIT_DISABLE_ENV = "AIORTC_DISABLE_RTX_RATE_LIMIT"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 class CongestionControlledSender(Protocol):
@@ -230,6 +232,10 @@ class TransportCongestionController:
     def allow_retransmission(
         self, *, size_bytes: int, now_ms: Optional[int] = None
     ) -> bool:
+        disabled = os.environ.get(RTX_RATE_LIMIT_DISABLE_ENV, "")
+        if disabled.lower() in _TRUE_ENV_VALUES:
+            return True
+
         now_ms = (
             clock.current_monotonic_us() // 1000
             if now_ms is None

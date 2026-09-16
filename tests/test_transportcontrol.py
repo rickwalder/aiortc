@@ -5,7 +5,10 @@ from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiortc.codecs import CODECS, HEADER_EXTENSIONS, init_codecs, is_rtx
-from aiortc.congestion import TransportCongestionController
+from aiortc.congestion import (
+    RTX_RATE_LIMIT_DISABLE_ENV,
+    TransportCongestionController,
+)
 from aiortc.rtcrtpparameters import RTCRtcpFeedback
 from aiortc.rtp import RtcpPsfbPacket, RtcpTransportLayerCcPacket, RtpPacket
 from aiortc.transportcontrol import (
@@ -564,6 +567,22 @@ class TransportCongestionControllerTest(TestCase):
         )
         self.assertTrue(
             controller.allow_retransmission(size_bytes=20_000, now_ms=501)
+        )
+
+    def test_retransmission_rate_limiter_can_be_disabled(self) -> None:
+        controller = TransportCongestionController()
+
+        with patch.dict(os.environ, {RTX_RATE_LIMIT_DISABLE_ENV: "1"}):
+            self.assertTrue(
+                controller.allow_retransmission(size_bytes=450_000, now_ms=0)
+            )
+
+        # Bypassed retransmissions do not consume the limiter's budget.
+        self.assertTrue(
+            controller.allow_retransmission(size_bytes=450_000, now_ms=0)
+        )
+        self.assertFalse(
+            controller.allow_retransmission(size_bytes=20_000, now_ms=0)
         )
 
     def test_initial_allocation_splits_pycc_transport_target_evenly(self) -> None:
