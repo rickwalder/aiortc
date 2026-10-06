@@ -173,11 +173,29 @@ def add_transport_description(
 async def add_remote_candidates(
     iceTransport: RTCIceTransport, media: sdp.MediaDescription
 ) -> None:
+    logger.info(
+        "remote_candidates.add_begin ice_transport_id=%s mid=%s kind=%s "
+        "candidate_count=%s complete=%s",
+        hex(id(iceTransport)),
+        media.rtp.muxId,
+        media.kind,
+        len(media.ice_candidates),
+        media.ice_candidates_complete,
+    )
     coros = map(iceTransport.addRemoteCandidate, media.ice_candidates)
     await asyncio.gather(*coros)
 
     if media.ice_candidates_complete:
         await iceTransport.addRemoteCandidate(None)
+    logger.info(
+        "remote_candidates.add_end ice_transport_id=%s mid=%s kind=%s "
+        "candidate_count=%s complete=%s",
+        hex(id(iceTransport)),
+        media.rtp.muxId,
+        media.kind,
+        len(media.ice_candidates),
+        media.ice_candidates_complete,
+    )
 
 
 def allocate_mid(mids: set[str]) -> str:
@@ -1013,6 +1031,20 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             if self.__sctp and self.__sctp.mid == primaryMid:
                 primaryTransport = self.__sctp.transport
 
+            logger.info(
+                "bundle.rebind_begin description_type=%s primary_mid=%s slave_mids=%s "
+                "primary_dtls_id=%s primary_ice_id=%s",
+                description.type,
+                primaryMid,
+                bundle.items[1:],
+                hex(id(primaryTransport)) if primaryTransport is not None else None,
+                (
+                    hex(id(primaryTransport.transport))
+                    if primaryTransport is not None
+                    else None
+                ),
+            )
+
             # replace transport for bundled media
             oldTransports = set()
             slaveMids = bundle.items[1:]
@@ -1021,7 +1053,19 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     transceiver.mid in slaveMids
                     and transceiver.receiver.transport != primaryTransport
                 ):
-                    oldTransports.add(transceiver.receiver.transport)
+                    oldTransport = transceiver.receiver.transport
+                    logger.info(
+                        "bundle.rebind_transceiver mid=%s kind=%s bundled=%s "
+                        "old_dtls_id=%s old_ice_id=%s new_dtls_id=%s new_ice_id=%s",
+                        transceiver.mid,
+                        transceiver.kind,
+                        transceiver._bundled,
+                        hex(id(oldTransport)),
+                        hex(id(oldTransport.transport)),
+                        hex(id(primaryTransport)),
+                        hex(id(primaryTransport.transport)),
+                    )
+                    oldTransports.add(oldTransport)
                     transceiver.receiver.setTransport(primaryTransport)
                     transceiver.sender.setTransport(primaryTransport)
                     transceiver._bundled = True
@@ -1030,27 +1074,93 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 and self.__sctp.mid in slaveMids
                 and self.__sctp.transport != primaryTransport
             ):
-                oldTransports.add(self.__sctp.transport)
+                oldTransport = self.__sctp.transport
+                logger.info(
+                    "bundle.rebind_sctp mid=%s bundled=%s old_dtls_id=%s "
+                    "old_ice_id=%s new_dtls_id=%s new_ice_id=%s",
+                    self.__sctp.mid,
+                    self.__sctp._bundled,
+                    hex(id(oldTransport)),
+                    hex(id(oldTransport.transport)),
+                    hex(id(primaryTransport)),
+                    hex(id(primaryTransport.transport)),
+                )
+                oldTransports.add(oldTransport)
                 self.__sctp.setTransport(primaryTransport)
                 self.__sctp._bundled = True
 
             # stop and discard old ICE transports
+            logger.info(
+                "bundle.old_transports description_type=%s count=%s transports=%s",
+                description.type,
+                len(oldTransports),
+                [
+                    {
+                        "dtls_id": hex(id(dtlsTransport)),
+                        "dtls_state": dtlsTransport.state,
+                        "ice_id": hex(id(dtlsTransport.transport)),
+                        "ice_state": dtlsTransport.transport.state,
+                    }
+                    for dtlsTransport in oldTransports
+                ],
+            )
             for dtlsTransport in oldTransports:
+                logger.info(
+                    "bundle.dtls_stop_begin dtls_id=%s state=%s ice_id=%s ice_state=%s",
+                    hex(id(dtlsTransport)),
+                    dtlsTransport.state,
+                    hex(id(dtlsTransport.transport)),
+                    dtlsTransport.transport.state,
+                )
                 await dtlsTransport.stop()
+                logger.info(
+                    "bundle.dtls_stop_end dtls_id=%s state=%s ice_id=%s ice_state=%s",
+                    hex(id(dtlsTransport)),
+                    dtlsTransport.state,
+                    hex(id(dtlsTransport.transport)),
+                    dtlsTransport.transport.state,
+                )
+                logger.info(
+                    "bundle.ice_stop_begin ice_id=%s state=%s",
+                    hex(id(dtlsTransport.transport)),
+                    dtlsTransport.transport.state,
+                )
                 await dtlsTransport.transport.stop()
+                logger.info(
+                    "bundle.ice_stop_end ice_id=%s state=%s",
+                    hex(id(dtlsTransport.transport)),
+                    dtlsTransport.transport.state,
+                )
                 self.__dtlsTransports.discard(dtlsTransport)
                 self.__iceTransports.discard(dtlsTransport.transport)
                 iceCandidates.pop(dtlsTransport.transport, None)
             self.__updateIceGatheringState()
             self.__updateIceConnectionState()
             self.__updateConnectionState()
+            logger.info(
+                "bundle.rebind_end description_type=%s primary_mid=%s "
+                "remaining_ice_candidate_transports=%s",
+                description.type,
+                primaryMid,
+                [hex(id(iceTransport)) for iceTransport in iceCandidates],
+            )
 
         # add remote candidates
+        logger.info(
+            "remote_candidates.batch_begin description_type=%s transport_count=%s",
+            description.type,
+            len(iceCandidates),
+        )
         coros = [
             add_remote_candidates(iceTransport, media)
             for iceTransport, media in iceCandidates.items()
         ]
         await asyncio.gather(*coros)
+        logger.info(
+            "remote_candidates.batch_end description_type=%s transport_count=%s",
+            description.type,
+            len(iceCandidates),
+        )
 
         # FIXME: in aiortc 2.0.0 emit RTCTrackEvent directly
         for event in trackEvents:

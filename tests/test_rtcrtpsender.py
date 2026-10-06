@@ -12,6 +12,7 @@ from aiortc.rtcrtpparameters import (
     RTCRtpCodecCapability,
     RTCRtpCodecParameters,
     RTCRtpHeaderExtensionCapability,
+    RTCRtpHeaderExtensionParameters,
     RTCRtpSendParameters,
 )
 from aiortc.rtcrtpsender import RTCRtpSender
@@ -326,7 +327,17 @@ class RTCRtpSenderTest(TestCase):
                 new_callable=AsyncMock,
             ) as mock_pace:
                 sender = RTCRtpSender(VideoStreamTrack(), local_transport)
-                await sender.send(RTCRtpSendParameters(codecs=[VP8_CODEC]))
+                await sender.send(
+                    RTCRtpSendParameters(
+                        codecs=[VP8_CODEC],
+                        headerExtensions=[
+                            RTCRtpHeaderExtensionParameters(
+                                id=5,
+                                uri=TRANSPORT_CC_URI,
+                            )
+                        ],
+                    )
+                )
 
                 await queue.get()
                 await sender.stop()
