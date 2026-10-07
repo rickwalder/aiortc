@@ -203,9 +203,13 @@ class Vp8Encoder(Encoder):
         ):
             self.codec = None
 
-        # Force a complete image if a keyframe was requested.
         if force_keyframe:
+            # Force a complete image if a keyframe was requested.
             frame.pict_type = av.video.frame.PictureType.I
+        else:
+            # Do not let source frame metadata force every encoded frame to be
+            # a keyframe.
+            frame.pict_type = av.video.frame.PictureType.NONE
 
         if self.codec is None:
             self.codec = av.CodecContext.create("libvpx", "w")

@@ -50,6 +50,9 @@ from .utils import random16, random32, uint16_add, uint32_add
 logger = logging.getLogger(__name__)
 
 RTT_ALPHA = 0.85
+DEFAULT_TARGET_BITRATE = 1_000_000
+MIN_TARGET_BITRATE = 500_000
+MAX_TARGET_BITRATE = 3_000_000
 
 
 def random_sequence_number() -> int:
@@ -107,9 +110,12 @@ class RTCRtpSender:
         self.__mid: Optional[str] = None
         self.__rtp_exited = asyncio.Event()
         self.__rtp_header_extensions_map = rtp.HeaderExtensionsMap()
+        self.__rtp_payload_type: Optional[int] = None
+        self.__rtp_sequence_number = random_sequence_number()
         self.__rtp_started = asyncio.Event()
         self.__rtp_task: Optional[asyncio.Future[None]] = None
         self.__rtp_history: dict[int, RtpPacket] = {}
+        self.__rtp_timestamp_origin = random32()
         self.__rtcp_exited = asyncio.Event()
         self.__rtcp_started = asyncio.Event()
         self.__rtcp_task: Optional[asyncio.Future[None]] = None
@@ -127,6 +133,7 @@ class RTCRtpSender:
         self.__octet_count = 0
         self.__packet_count = 0
         self.__rtt: Optional[float] = None
+        self.__target_bitrate: Optional[int] = None
 
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
@@ -251,6 +258,9 @@ class RTCRtpSender:
                         self.__rtt = rtt
                     else:
                         self.__rtt = RTT_ALPHA * self.__rtt + (1 - RTT_ALPHA) * rtt
+                    self.__transport._congestion_controller.set_rtt(
+                        max(1, int(self.__rtt * 1000))
+                    )
 
                 self.__stats.add(
                     RTCRemoteInboundRtpStreamStats(
@@ -286,8 +296,6 @@ class RTCRtpSender:
                     self.__log_debug(
                         "- receiver estimated maximum bitrate %d bps", bitrate
                     )
-                    if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
-                        self.__encoder.target_bitrate = bitrate
             except ValueError:
                 pass
 
@@ -307,6 +315,10 @@ class RTCRtpSender:
 
         if self.__encoder is None:
             self.__encoder = get_encoder(codec)
+            if self.__target_bitrate is not None and hasattr(
+                self.__encoder, "target_bitrate"
+            ):
+                self.__encoder.target_bitrate = self.__target_bitrate
 
         if isinstance(data, Frame):
             # Encode the frame.
@@ -345,8 +357,12 @@ class RTCRtpSender:
                 self.__rtx_sequence_number = uint16_add(self.__rtx_sequence_number, 1)
 
             self.__log_debug("> %s", packet)
-            packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
-            await self.transport._send_rtp(packet_bytes)
+            await self.transport._send_rtp_packet(
+                packet,
+                self.__rtp_header_extensions_map,
+                is_video=self.__kind == "video",
+                is_retransmission=True,
+            )
 
     def _send_keyframe(self) -> None:
         """
@@ -354,12 +370,57 @@ class RTCRtpSender:
         """
         self.__force_keyframe = True
 
+    def _create_rtp_padding_packet(
+        self, padding_size: int
+    ) -> Optional[tuple[RtpPacket, rtp.HeaderExtensionsMap]]:
+        if (
+            self.__kind != "video"
+            or self.__rtp_payload_type is None
+            or self.__rtp_timestamp == 0
+            or padding_size <= 0
+        ):
+            return None
+
+        packet = RtpPacket(
+            payload_type=self.__rtp_payload_type,
+            sequence_number=self.__rtp_sequence_number,
+            timestamp=self.__rtp_timestamp,
+            ssrc=self._ssrc,
+        )
+        packet.padding_size = min(255, padding_size)
+        packet.extensions.mid = self.__mid
+
+        self.__rtp_sequence_number = uint16_add(self.__rtp_sequence_number, 1)
+        self.__packet_count += 1
+        return packet, self.__rtp_header_extensions_map
+
+    def _get_target_bitrate(self) -> Optional[int]:
+        if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
+            return self.__encoder.target_bitrate
+        return self.__target_bitrate or DEFAULT_TARGET_BITRATE
+
+    def _get_bitrate_bounds(self) -> tuple[int, int]:
+        if self.__kind != "video":
+            return (0, 0)
+        return (MIN_TARGET_BITRATE, MAX_TARGET_BITRATE)
+
+    def _set_target_bitrate(self, bitrate: int) -> None:
+        if self.__kind != "video":
+            return
+        min_bitrate, max_bitrate = self._get_bitrate_bounds()
+        bitrate = max(min_bitrate, min(max_bitrate, bitrate))
+        current = self._get_target_bitrate()
+        if current == bitrate:
+            return
+        self.__target_bitrate = bitrate
+        if self.__encoder is not None and hasattr(self.__encoder, "target_bitrate"):
+            self.__encoder.target_bitrate = bitrate
+
     async def _run_rtp(self, codec: RTCRtpCodecParameters) -> None:
         self.__log_debug("- RTP started")
         self.__rtp_started.set()
+        self.__rtp_payload_type = codec.payloadType
 
-        sequence_number = random_sequence_number()
-        timestamp_origin = random32()
         try:
             while True:
                 if not self.__track:
@@ -372,12 +433,14 @@ class RTCRtpSender:
                 if enc_frame is None:
                     continue
 
-                timestamp = uint32_add(timestamp_origin, enc_frame.timestamp)
+                timestamp = uint32_add(
+                    self.__rtp_timestamp_origin, enc_frame.timestamp
+                )
 
                 for i, payload in enumerate(enc_frame.payloads):
                     packet = RtpPacket(
                         payload_type=codec.payloadType,
-                        sequence_number=sequence_number,
+                        sequence_number=self.__rtp_sequence_number,
                         timestamp=timestamp,
                     )
                     packet.ssrc = self._ssrc
@@ -385,9 +448,6 @@ class RTCRtpSender:
                     packet.marker = (i == len(enc_frame.payloads) - 1) and 1 or 0
 
                     # set header extensions
-                    packet.extensions.abs_send_time = (
-                        clock.current_ntp_time() >> 14
-                    ) & 0x00FFFFFF
                     packet.extensions.mid = self.__mid
                     if enc_frame.audio_level is not None:
                         packet.extensions.audio_level = (False, -enc_frame.audio_level)
@@ -397,14 +457,20 @@ class RTCRtpSender:
                     self.__rtp_history[packet.sequence_number % RTP_HISTORY_SIZE] = (
                         packet
                     )
-                    packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
-                    await self.transport._send_rtp(packet_bytes)
+                    self.__rtp_sequence_number = uint16_add(
+                        self.__rtp_sequence_number, 1
+                    )
+                    await self.transport._send_rtp_packet(
+                        packet,
+                        self.__rtp_header_extensions_map,
+                        is_video=self.__kind == "video",
+                        payload_size_bytes=len(payload),
+                    )
 
                     self.__ntp_timestamp = clock.current_ntp_time()
                     self.__rtp_timestamp = packet.timestamp
                     self.__octet_count += len(payload)
                     self.__packet_count += 1
-                    sequence_number = uint16_add(sequence_number, 1)
         except (asyncio.CancelledError, ConnectionError, MediaStreamError):
             pass
         except Exception:
@@ -419,6 +485,7 @@ class RTCRtpSender:
 
         # release encoder
         self.__encoder = None
+        self.__rtp_payload_type = None
 
         self.__log_debug("- RTP finished")
         self.__rtp_exited.set()

@@ -18,6 +18,12 @@ class ClockTest(TestCase):
         )
         self.assertEqual(clock.current_ms(), 3745612801000)
 
+    @patch("aiortc.clock.time.monotonic_ns")
+    def test_current_monotonic_us(self, mock_monotonic_ns: MagicMock) -> None:
+        mock_monotonic_ns.return_value = 1234567890123
+
+        self.assertEqual(clock.current_monotonic_us(), 1234567890)
+
     def test_datetime_from_ntp(self) -> None:
         dt = datetime.datetime(
             2018, 6, 28, 9, 3, 5, 423998, tzinfo=datetime.timezone.utc

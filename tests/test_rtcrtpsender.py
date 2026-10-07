@@ -1,7 +1,7 @@
 import asyncio
 from struct import pack
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiortc import MediaStreamTrack
 from aiortc.codecs import PCMU_CODEC
@@ -12,6 +12,7 @@ from aiortc.rtcrtpparameters import (
     RTCRtpCodecCapability,
     RTCRtpCodecParameters,
     RTCRtpHeaderExtensionCapability,
+    RTCRtpHeaderExtensionParameters,
     RTCRtpSendParameters,
 )
 from aiortc.rtcrtpsender import RTCRtpSender
@@ -29,6 +30,7 @@ from aiortc.rtp import (
     pack_remb_fci,
 )
 from aiortc.stats import RTCStatsReport
+from pycc import TRANSPORT_CC_URI
 
 from tests.test_mediastreams import VideoPacketStreamTrack
 
@@ -120,6 +122,9 @@ class RTCRtpSenderTest(TestCase):
                 ),
                 RTCRtpHeaderExtensionCapability(
                     uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+                ),
+                RTCRtpHeaderExtensionCapability(
+                    uri=TRANSPORT_CC_URI
                 ),
             ],
         )
@@ -305,6 +310,39 @@ class RTCRtpSenderTest(TestCase):
             # wait for packet to be transmitted, then shutdown
             await asyncio.sleep(0.1)
             await sender.stop()
+
+    @asynctest
+    async def test_send_video_uses_pacer(self) -> None:
+        queue: asyncio.Queue[RtpPacket] = asyncio.Queue()
+
+        async def mock_send_rtp(data: bytes) -> None:
+            if not is_rtcp(data):
+                await queue.put(RtpPacket.parse(data))
+
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            local_transport._send_rtp = mock_send_rtp  # type: ignore
+
+            with patch(
+                "aiortc.congestion.AsyncRtpPacer.pace",
+                new_callable=AsyncMock,
+            ) as mock_pace:
+                sender = RTCRtpSender(VideoStreamTrack(), local_transport)
+                await sender.send(
+                    RTCRtpSendParameters(
+                        codecs=[VP8_CODEC],
+                        headerExtensions=[
+                            RTCRtpHeaderExtensionParameters(
+                                id=5,
+                                uri=TRANSPORT_CC_URI,
+                            )
+                        ],
+                    )
+                )
+
+                await queue.get()
+                await sender.stop()
+
+        self.assertGreater(mock_pace.await_count, 0)
 
     @asynctest
     async def test_handle_encoded_packet(self) -> None:

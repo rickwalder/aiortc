@@ -46,6 +46,7 @@ H264_SDP = lf2crlf(
 a=rtcp-fb:99 nack
 a=rtcp-fb:99 nack pli
 a=rtcp-fb:99 goog-remb
+a=rtcp-fb:99 transport-cc
 a=fmtp:99 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
 a=rtpmap:100 rtx/90000
 a=fmtp:100 apt=99
@@ -53,6 +54,7 @@ a=rtpmap:101 H264/90000
 a=rtcp-fb:101 nack
 a=rtcp-fb:101 nack pli
 a=rtcp-fb:101 goog-remb
+a=rtcp-fb:101 transport-cc
 a=fmtp:101 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 a=rtpmap:102 rtx/90000
 a=fmtp:102 apt=101
@@ -63,6 +65,7 @@ VP8_SDP = lf2crlf(
 a=rtcp-fb:97 nack
 a=rtcp-fb:97 nack pli
 a=rtcp-fb:97 goog-remb
+a=rtcp-fb:97 transport-cc
 a=rtpmap:98 rtx/90000
 a=fmtp:98 apt=97
 """

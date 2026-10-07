@@ -352,11 +352,90 @@ class RTCIceTransport(AsyncIOEventEmitter):
         Irreversibly stop the :class:`RTCIceTransport`.
         """
         if self.state != "closed":
+            connection = self._connection
+            protocols = list(getattr(connection, "_protocols", []))
+            protocol_details = []
+            for protocol in protocols:
+                candidate = getattr(protocol, "local_candidate", None)
+                protocol_details.append(
+                    {
+                        "protocol_id": getattr(protocol, "id", None),
+                        "candidate": (
+                            f"{candidate.host}:{candidate.port}/{candidate.transport}"
+                            if candidate is not None
+                            else None
+                        ),
+                        "transport": repr(getattr(protocol, "transport", None)),
+                    }
+                )
+
+                closed_future = getattr(protocol, "_StunProtocol__closed", None)
+                if closed_future is not None:
+                    protocol_id = getattr(protocol, "id", None)
+                    ice_transport_id = hex(id(self))
+                    connection_id = getattr(connection, "id", None)
+
+                    def log_protocol_closed(
+                        _future: asyncio.Future,
+                        *,
+                        protocol_id: int | None = protocol_id,
+                        ice_transport_id: str = ice_transport_id,
+                        connection_id: int | None = connection_id,
+                    ) -> None:
+                        logger.info(
+                            "ice.protocol_closed ice_transport_id=%s "
+                            "connection_id=%s protocol_id=%s",
+                            ice_transport_id,
+                            connection_id,
+                            protocol_id,
+                        )
+
+                    closed_future.add_done_callback(log_protocol_closed)
+
+            logger.info(
+                "ice.stop_begin ice_transport_id=%s state=%s connection_id=%s "
+                "gatherer_state=%s local_candidate_count=%s "
+                "remote_candidate_count=%s protocol_count=%s protocols=%s",
+                hex(id(self)),
+                self.state,
+                getattr(connection, "id", None),
+                self.iceGatherer.state,
+                len(self.iceGatherer.getLocalCandidates()),
+                len(self.getRemoteCandidates()),
+                len(protocols),
+                protocol_details,
+            )
             self.__setState("closed")
-            await self._connection.close()
+            logger.info(
+                "ice.connection_close_begin ice_transport_id=%s connection_id=%s",
+                hex(id(self)),
+                getattr(connection, "id", None),
+            )
+            await connection.close()
+            logger.info(
+                "ice.connection_close_end ice_transport_id=%s connection_id=%s",
+                hex(id(self)),
+                getattr(connection, "id", None),
+            )
             if self.__monitor_task is not None:
+                logger.info(
+                    "ice.monitor_wait_begin ice_transport_id=%s connection_id=%s",
+                    hex(id(self)),
+                    getattr(connection, "id", None),
+                )
                 await self.__monitor_task
                 self.__monitor_task = None
+                logger.info(
+                    "ice.monitor_wait_end ice_transport_id=%s connection_id=%s",
+                    hex(id(self)),
+                    getattr(connection, "id", None),
+                )
+            logger.info(
+                "ice.stop_end ice_transport_id=%s state=%s connection_id=%s",
+                hex(id(self)),
+                self.state,
+                getattr(connection, "id", None),
+            )
 
     async def _monitor(self) -> None:
         while True:

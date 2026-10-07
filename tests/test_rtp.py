@@ -13,6 +13,7 @@ from aiortc.rtp import (
     RtcpRtpfbPacket,
     RtcpSdesPacket,
     RtcpSrPacket,
+    RtcpTransportLayerCcPacket,
     RtpPacket,
     clamp_packets_lost,
     pack_header_extensions,
@@ -25,6 +26,7 @@ from aiortc.rtp import (
     wrap_rtx,
 )
 from av import AudioFrame
+from pycc import TransportLayerCcPacket, TwccPacketStatus
 
 from .utils import TestCase, load
 
@@ -225,6 +227,56 @@ class RtcpPacketTest(TestCase):
         )
         self.assertEqual(bytes(packet), data)
 
+    def test_rtpfb_transport_cc(self) -> None:
+        feedback = TransportLayerCcPacket(
+            sender_ssrc=1234,
+            media_ssrc=5678,
+            base_sequence_number=100,
+            feedback_packet_count=7,
+            reference_time_us=64_000,
+            packets=[
+                TwccPacketStatus(sequence_number=100, receive_delta_us=1_000),
+                TwccPacketStatus(sequence_number=101, receive_delta_us=None),
+                TwccPacketStatus(sequence_number=102, receive_delta_us=70_000),
+            ],
+        )
+        packet = RtcpTransportLayerCcPacket(feedback=feedback)
+
+        packets = RtcpPacket.parse(bytes(packet))
+
+        parsed = self.ensureIsInstance(packets[0], RtcpTransportLayerCcPacket)
+        self.assertEqual(parsed.fmt, rtp.RTCP_RTPFB_TRANSPORT_CC)
+        self.assertEqual(parsed.ssrc, 1234)
+        self.assertEqual(parsed.media_ssrc, 5678)
+        self.assertEqual(parsed.feedback.packets, feedback.packets)
+        self.assertEqual(bytes(parsed), bytes(packet))
+
+    def test_rtpfb_transport_cc_incoming_fmt_15_golden_vector(self) -> None:
+        data = bytes.fromhex(
+            "afcd000711111111222222220bb8000700000305d891010118fffc0002000003"
+        )
+
+        packets = RtcpPacket.parse(data)
+
+        parsed = self.ensureIsInstance(packets[0], RtcpTransportLayerCcPacket)
+        self.assertEqual(parsed.fmt, 15)
+        self.assertEqual(parsed.ssrc, 0x11111111)
+        self.assertEqual(parsed.media_ssrc, 0x22222222)
+        self.assertEqual(parsed.feedback.base_sequence_number, 3000)
+        self.assertEqual(parsed.feedback.feedback_packet_count, 5)
+        self.assertEqual(
+            parsed.feedback.packets,
+            [
+                TwccPacketStatus(3000, 250),
+                TwccPacketStatus(3001, 70_000),
+                TwccPacketStatus(3002, None),
+                TwccPacketStatus(3003, -1_000),
+                TwccPacketStatus(3004, 0),
+                TwccPacketStatus(3005, None),
+                TwccPacketStatus(3006, 500),
+            ],
+        )
+
     def test_rtpfb_invalid(self) -> None:
         data = load("rtcp_rtpfb_invalid.bin")
 
@@ -299,6 +351,7 @@ class RtpPacketTest(TestCase):
 
     def test_padding_only_with_header_extensions(self) -> None:
         extensions_map = rtp.HeaderExtensionsMap()
+        self.assertFalse(extensions_map.has_transport_sequence_number)
         extensions_map.configure(
             RTCRtpParameters(
                 headerExtensions=[
@@ -638,6 +691,7 @@ class RtpUtilTest(TestCase):
                 ]
             )
         )
+        self.assertTrue(extensions_map.has_transport_sequence_number)
 
         packet = RtpPacket.parse(data, extensions_map)
 
